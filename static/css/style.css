@@ -1223,3 +1223,28 @@ a { color: inherit; text-decoration: none; }
   .browser-frame { height: 360px; }
   .news-row-thumb { width: 58px; height: 44px; }
 }
+
+/* ── Footer ──────────────────────────────────────────────────────────── */
+.site-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  padding: 1rem 2rem;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--fg-3);
+  border-top: 1px solid var(--border);
+  background: var(--bg-raised);
+}
+.site-footer a {
+  color: var(--fg-2);
+  text-decoration: none;
+  transition: color 0.15s;
+}
+.site-footer a:hover { color: var(--fg); }
+.footer-gh {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
