@@ -1,0 +1,5 @@
+flask>=3.0
+feedparser>=6.0
+requests>=2.31
+newspaper4k>=0.9
+lxml_html_clean

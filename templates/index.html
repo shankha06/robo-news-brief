@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>The Brief — Your Morning Intelligence</title>
+  <meta name="description" content="Curated news, market data, football, and AI research — everything that matters, in one place.">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="The Brief">
+  <!-- Inline SVG favicon — newspaper icon -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#128220;</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Newsreader:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-inner">
+      <div class="header-left">
+        <h1 class="logo">
+          <span class="logo-the">The</span> Brief
+        </h1>
+        <div class="header-divider"></div>
+        <time class="header-date" id="currentDate"></time>
+        <span class="header-edition" id="editionLabel"></span>
+      </div>
+      <div class="header-right">
+        <span class="live-dot"></span>
+        <span class="live-label">LIVE</span>
+        <span class="last-updated" id="lastUpdated">--</span>
+        <button class="icon-btn" id="refreshAll" title="Refresh all feeds">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Search -->
+  <section class="search-section">
+    <form class="search-box" id="searchForm" onsubmit="return false;">
+      <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <input type="text" id="searchInput" class="search-input" placeholder="Search Google..." autocomplete="off" spellcheck="false">
+      <kbd class="search-kbd">Enter</kbd>
+    </form>
+  </section>
+
+  <!-- Market Ticker -->
+  <section class="ticker-strip">
+    <div class="ticker-track" id="tickerTrack">
+      <span class="ticker-placeholder">Loading markets...</span>
+    </div>
+  </section>
+
+  <!-- Main Grid -->
+  <main class="grid-main">
+
+    <!-- Top News -->
+    <section class="col col-news">
+      <div class="col-head">
+        <h2 class="col-title">Top Stories</h2>
+        <nav class="pill-nav" id="newsFilters">
+          <button class="pill active" data-filter="all">All</button>
+          <button class="pill" data-filter="Finance">Finance</button>
+          <button class="pill" data-filter="AI">AI</button>
+          <button class="pill" data-filter="Tech">Tech</button>
+          <button class="pill" data-filter="Politics">Politics</button>
+          <button class="pill" data-filter="Jobs">Jobs</button>
+        </nav>
+      </div>
+      <div class="col-body scroll-area" id="topNewsContainer">
+        <div class="skeleton-loader">
+          <div class="skel skel-hero"></div>
+          <div class="skel skel-row"></div>
+          <div class="skel skel-row"></div>
+          <div class="skel skel-row"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Football -->
+    <section class="col col-football">
+      <div class="col-head">
+        <h2 class="col-title">Football</h2>
+      </div>
+      <div class="col-body scroll-area" id="footballContainer">
+        <div class="skeleton-loader">
+          <div class="skel skel-row"></div>
+          <div class="skel skel-row"></div>
+          <div class="skel skel-row"></div>
+          <div class="skel skel-row"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- AI / ML Research -->
+    <section class="col col-ai">
+      <div class="col-head">
+        <h2 class="col-title">AI / ML Research</h2>
+        <nav class="pill-nav" id="aiFilters">
+          <button class="pill active" data-filter="all">All</button>
+          <button class="pill" data-filter="LLM">LLM</button>
+          <button class="pill" data-filter="RL">RL</button>
+          <button class="pill" data-filter="Agents">Agents</button>
+          <button class="pill" data-filter="Retrieval">RAG</button>
+        </nav>
+      </div>
+      <div class="col-body scroll-area" id="aiContainer">
+        <div class="skeleton-loader">
+          <div class="skel skel-row"></div>
+          <div class="skel skel-row"></div>
+          <div class="skel skel-row"></div>
+          <div class="skel skel-row"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Match Scores Banner -->
+  <section class="scores-banner">
+    <div class="scores-banner-inner">
+      <div class="scores-label">RECENT SCORES</div>
+      <div class="scores-track-wrap">
+        <div class="scores-track" id="scoresTrack">
+          <span class="scores-placeholder">Loading scores...</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Article Reader Modal -->
+  <div class="reader-overlay" id="readerOverlay">
+    <div class="reader-modal">
+      <div class="reader-chrome">
+        <div class="reader-source" id="readerSource"></div>
+        <div class="reader-actions">
+          <a class="reader-ext-link" id="readerExtLink" href="#" target="_blank" rel="noopener" title="Open in new tab">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+          </a>
+          <button class="reader-close-btn" id="readerClose" title="Close">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="reader-body" id="readerBody">
+        <div class="reader-loading">
+          <div class="skel skel-hero"></div>
+          <div class="skel skel-row"></div>
+          <div class="skel skel-row"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

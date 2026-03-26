@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: the-brief
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: FLASK_DEBUG
+        value: "0"
