@@ -439,12 +439,12 @@
             const hDisp = isPoss ? `${hv}%` : hv;
             const aDisp = isPoss ? `${av}%` : av;
             html += `<div class="stat-row">
+              <span class="stat-label">${key}</span>
               <span class="stat-val-l">${hDisp}</span>
               <div class="stat-bar-wrap">
                 <div class="stat-bar-home" style="width:${hPct}%"></div>
                 <div class="stat-bar-away" style="width:${100 - hPct}%"></div>
               </div>
-              <span class="stat-label">${key}</span>
               <span class="stat-val-r">${aDisp}</span>
             </div>`;
           }

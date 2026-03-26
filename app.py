@@ -116,24 +116,155 @@ def _set_cache(key: str, data):
 # News relevance scoring
 # ---------------------------------------------------------------------------
 
-HIGH_PRIORITY_KEYWORDS = [
-    # India-critical
-    "india", "modi", "rbi", "sensex", "nifty", "rupee", "parliament", "lok sabha",
-    "rajya sabha", "supreme court", "delhi", "mumbai", "bengaluru", "bangalore",
-    "hyderabad", "chennai", "kolkata", "pune", "budget", "gdp", "inflation",
-    "isro", "upi", "aadhaar", "gst",
+# Weighted keyword dict — specific/rare keywords score higher than broad ones.
+# Low weights (0.5) prevent common words like "ai", "startup" from inflating scores.
+HIGH_PRIORITY_KEYWORDS = {
+    # India-critical (city names low weight — appear in every India story)
+    "india": 1.5, "modi": 3.0, "rbi": 3.0, "sensex": 1.5, "nifty": 1.5,
+    "rupee": 1.5, "parliament": 2.5, "lok sabha": 3.0, "rajya sabha": 3.0,
+    "supreme court": 2.5, "delhi": 1.0, "mumbai": 1.0, "bengaluru": 1.0,
+    "bangalore": 1.0, "hyderabad": 0.5, "chennai": 0.5, "kolkata": 0.5,
+    "pune": 0.5, "budget": 2.5, "gdp": 2.0, "inflation": 2.0,
+    "isro": 2.0, "upi": 1.5, "aadhaar": 1.0, "gst": 1.5,
     # Finance
-    "market crash", "rally", "interest rate", "fed", "recession", "ipo",
-    "stock market", "bull", "bear", "sebi",
-    # Tech & Jobs
-    "layoff", "job cut", "hiring freeze", "wfh", "remote work", "ai",
-    "startup", "unicorn", "funding",
-    # Geopolitics that affects India
-    "tariff", "trade war", "china", "pakistan", "us-india", "sanctions",
-    "opec", "oil price", "climate", "g20", "brics",
-    # Big impact
-    "breaking", "exclusive", "major", "crisis", "emergency", "war",
-    "election", "resignation", "arrested",
+    "market crash": 4.5, "rally": 1.0, "interest rate": 2.5, "fed": 2.0,
+    "recession": 4.0, "ipo": 2.0, "stock market": 1.5, "bull": 0.5,
+    "bear": 0.5, "sebi": 2.0,
+    # Tech & Jobs (broad terms deliberately low to prevent inflation)
+    "layoff": 3.0, "job cut": 3.5, "hiring freeze": 3.5, "wfh": 0.5,
+    "remote work": 0.5, "ai": 0.5, "startup": 0.5, "unicorn": 1.5,
+    "funding": 0.5,
+    # Geopolitics
+    "tariff": 2.0, "trade war": 4.0, "china": 1.5, "pakistan": 2.0,
+    "us-india": 3.0, "sanctions": 3.0, "opec": 2.5, "oil price": 2.0,
+    "climate": 1.0, "g20": 2.0, "brics": 1.5,
+    # Big impact (rare = high weight)
+    "breaking": 4.0, "exclusive": 1.5, "major": 0.5, "crisis": 4.0,
+    "emergency": 4.5, "war": 4.0, "election": 2.5, "resignation": 3.5,
+    "arrested": 2.5,
+}
+
+# Source authority — credible editorial outlets rank higher than aggregator feeds
+SOURCE_AUTHORITY = {
+    # Tier 1: editorial oversight, fact-checking, journalistic standards
+    "BBC News": 6.0,
+    "BBC Business": 6.0,
+    "BBC Football": 6.0,
+    "ESPN Soccer": 5.0,
+    "Times of India": 5.0,
+    "NDTV": 5.0,
+    "Economic Times": 5.0,
+    "Livemint": 4.5,
+    "Moneycontrol": 4.0,
+    "TechCrunch": 4.5,
+    # Tier 2: aggregator feeds (content varies in quality)
+    "Google News": 2.0,
+    "Google News India": 2.0,
+    # Tier 3: narrow-topic Google feeds (lowest editorial control)
+    "Google Tech": 1.5,
+    "Google Football": 1.5,
+    "Google Transfer News": 1.0,
+    "Google Jobs/Layoffs": 1.0,
+    "Google AI News": 1.5,
+}
+
+# Hard-news action verbs in title — something actually HAPPENED (not just discussed)
+_HARD_NEWS_VERB_RE = re.compile(
+    r'\b(?:signs?|signed|passes?|passed|announces?|announced|cuts?|raises?|hikes?|'
+    r'bans?|banning|arrests?|arrested|resigns?|resigned|fires?|fired|sacks?|sacked|'
+    r'orders?|launches?|launched|declares?|declared|wins?|defeats?|attacks?|invaded|'
+    r'crashes?|collapsed|defaults?|sanctions?|indicts?|convicted|sentenced|suspended|'
+    r'impeached|ousted|dismissed|cancels?|cancelled|approves?|approved|rejects?|rejected|'
+    r'kills?|killed|dies|died|explodes?|exploded|strikes?|struck|seizes?|seized)\b',
+    re.IGNORECASE,
+)
+
+# Compiled regex for soft-news / noise detection (titles only)
+_SOFT_NEWS_RE = re.compile(
+    r'(?:opinion|analysis|review|explainer|column)\s*[:\-]'
+    r'|\bhow\s+to\s+\w+'
+    r'|\b\d+\s+(?:ways|tips|reasons|things|best|must[- ]know)\b'
+    r'|all\s+you\s+need\s+to\s+know'
+    r'|everything\s+you\s+need'
+    r"|here['\u2019]s\s+what\s+(?:you|we)"
+    r'|\bguide\s+to\s+\w+'
+    r'|\bwatch\s*:'
+    r'|\bin\s+pictures\b'
+    r'|weekly\s+(?:roundup|wrap)'
+    r'|monthly\s+digest',
+    re.IGNORECASE,
+)
+
+# Compiled regex for numeric magnitude (scale of real-world impact)
+_CASUALTY_RE = re.compile(
+    r'\b\d[\d,]*\s*(?:killed|dead|died|casualties|wounded|injured|missing)\b',
+    re.IGNORECASE,
+)
+_BIG_MONEY_RE = re.compile(
+    r'(?:\$|₹|€|£)\s*\d+(?:\.\d+)?\s*(?:billion|trillion)\b'
+    r'|\b\d+(?:\.\d+)?\s*(?:billion|trillion)\b',
+    re.IGNORECASE,
+)
+_MARKET_MOVE_RE = re.compile(
+    r'\b\d+(?:\.\d+)?%?\s*(?:drop|crash|plunge|surge|soar|collapses?|jumps?)\b',
+    re.IGNORECASE,
+)
+
+# Breaking/urgency signals — used by editors only for genuinely major stories
+BREAKING_SIGNALS = [
+    "breaking", "breaking news", "just in", "urgent", "alert", "developing",
+    "live updates", "live:", "flash:", "exclusive:", "at this hour",
+]
+
+# High-impact importance signals — scale, severity, historic nature
+IMPORTANCE_SIGNALS = [
+    # Historic/unprecedented
+    "record high", "record low", "all-time high", "all-time low", "historic",
+    "landmark", "unprecedented", "first ever", "first time in history",
+    # Catastrophic events
+    "catastrophic", "devastating", "collapse", "explosion", "blast",
+    "earthquake", "floods", "disaster",
+    # Casualties / human impact
+    "killed", "dead", "casualties", "death toll", "fatalities", "wounded",
+    "missing", "plane crash", "train crash",
+    # Major decisions / legal
+    "arrested", "indicted", "convicted", "sentenced", "ban", "banned",
+    "parliament passes", "bill passed", "supreme court rules", "court orders",
+    "declares emergency", "emergency declared", "martial law",
+    # Economic scale
+    "billion dollar", "trillion", "market crash", "stock market crash",
+    "currency crisis", "debt default", "bankruptcy", "bank collapse",
+    # Political shocks
+    "resignation", "resigned", "ousted", "coup", "impeached", "fired",
+    "invasion", "attack", "war declared", "ceasefire declared",
+]
+
+# Football-specific importance signals
+FOOTBALL_IMPORTANCE_SIGNALS = [
+    # High-stakes competitions
+    "champions league", "world cup", "euro 2024", "euro 2025", "euro 2026",
+    "copa america", "europa league", "fa cup", "carabao cup", "community shield",
+    "conference league", "supercopa", "dfb-pokal",
+    # Stage of competition
+    "final", "semi-final", "semifinal", "quarter-final", "quarterfinal",
+    "knockout stage", "round of 16", "last 16", "last 8", "group stage",
+    # Decisive outcomes
+    "wins title", "crowned champions", "lifts the trophy", "relegated",
+    "promotion", "promoted", "qualifies", "qualification", "advances",
+    "knocked out", "eliminat", "title race", "title decider",
+    # Big match events
+    "hat-trick", "brace", "red card", "penalty shootout", "extra time",
+    "comeback", "comeback victory", "thriller", "stunner", "upset",
+    "derby", "el clasico", "north west derby", "merseyside derby",
+    # Transfer news
+    "record transfer", "world record", "transfer confirmed", "officially signs",
+    "unveiled", "done deal", "departure confirmed", "free agent signs",
+    # Managerial
+    "sacked", "appointed manager", "new manager", "manager resigns",
+    "interim manager",
+    # Player news
+    "injured", "ruled out", "long-term injury", "suspended", "banned",
+    "returns from injury", "retirement announced", "retires",
 ]
 
 # AI/ML keywords for scoring research articles
@@ -216,41 +347,166 @@ AI_CATEGORY_TAGS = {
 }
 
 
+def _title_fingerprint(title: str) -> frozenset:
+    """Extract key content words from title for cross-source story clustering."""
+    STOP = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "to", "of",
+        "in", "on", "at", "for", "with", "by", "from", "and", "or", "but", "not",
+        "as", "it", "its", "he", "she", "they", "we", "i", "this", "that", "which",
+        "who", "has", "have", "had", "will", "would", "could", "should", "after",
+        "before", "over", "under", "up", "down", "says", "said", "says",
+    }
+    words = re.findall(r'\b[a-z]+\b', title.lower())
+    return frozenset(w for w in words if w not in STOP and len(w) > 2)
+
+
 def _score_article(item: dict) -> float:
-    """Score an article by relevance. Higher = more important."""
-    text = (item.get("title", "") + " " + item.get("description", "")).lower()
-    score = 0.0
+    """Score article importance using multiplicative recency.
 
-    for kw in HIGH_PRIORITY_KEYWORDS:
-        if kw in text:
-            score += 2.0
+    Formula: max(importance, 0) * recency_multiplier + source_authority
 
-    # Boost recent articles
-    pub = item.get("published", "")
-    if pub:
-        try:
-            age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(pub)).total_seconds() / 3600
-            if age_hours < 3:
-                score += 5.0
-            elif age_hours < 6:
-                score += 3.0
-            elif age_hours < 12:
-                score += 1.5
-            elif age_hours < 24:
-                score += 0.5
-        except Exception:
-            pass
+    This ensures recency amplifies importance rather than replacing it —
+    a trivial recent article cannot outscore a genuinely important older one.
+    """
+    title = item.get("title", "").lower()
+    desc  = item.get("description", "").lower()
+    pub   = item.get("published", "")
+    importance = 0.0
 
-    # Deprioritize hyperlocal foreign news
+    # Keywords: title match = 3× weight (headline is the primary editorial signal).
+    # A keyword in a title means the article IS about that topic.
+    # In description it might just be context.
+    for kw, weight in HIGH_PRIORITY_KEYWORDS.items():
+        if kw in title:
+            importance += weight * 3.0
+        elif kw in desc:
+            importance += weight * 0.8
+
+    # Breaking/urgency — editors only use these labels for genuinely major events
+    for kw in BREAKING_SIGNALS:
+        if kw in title:
+            importance += 10.0
+            break
+
+    # High-impact event signals — title match worth much more than description
+    for kw in IMPORTANCE_SIGNALS:
+        if kw in title:
+            importance += 8.0
+        elif kw in desc:
+            importance += 3.0
+
+    # Hard-news action verb in title: something actually HAPPENED
+    if _HARD_NEWS_VERB_RE.search(title):
+        importance += 6.0
+
+    # Numeric magnitude — real-world scale in the headline
+    if _CASUALTY_RE.search(title):
+        importance += 14.0
+    elif _CASUALTY_RE.search(desc):
+        importance += 6.0
+    if _BIG_MONEY_RE.search(title):
+        importance += 9.0
+    elif _BIG_MONEY_RE.search(desc):
+        importance += 4.0
+    if _MARKET_MOVE_RE.search(title):
+        importance += 8.0
+
+    # Soft-news penalty — drags importance below 0 so recency can't rescue it
+    if _SOFT_NEWS_RE.search(title):
+        importance -= 20.0
+
+    # Hyperlocal foreign penalty
+    text = title + " " + desc
     local_foreign = [
         "county", "sheriff", "township", "borough", "precinct", "school board",
         "state trooper", "local police", "neighborhood",
     ]
-    if any(lf in text for lf in local_foreign):
-        if "india" not in text:
-            score -= 8.0
+    if any(lf in text for lf in local_foreign) and "india" not in text:
+        importance -= 25.0
 
-    return score
+    # Recency multiplier — proportionally amplifies importance, not a flat add.
+    # Result: a trivially important article stays trivially important even when fresh.
+    age_h = None
+    if pub:
+        try:
+            age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(pub)).total_seconds() / 3600
+        except Exception:
+            pass
+    if age_h is None:
+        recency_mult = 0.7
+    elif age_h < 1:
+        recency_mult = 2.5
+    elif age_h < 3:
+        recency_mult = 2.0
+    elif age_h < 6:
+        recency_mult = 1.6
+    elif age_h < 12:
+        recency_mult = 1.3
+    elif age_h < 24:
+        recency_mult = 1.0
+    elif age_h < 48:
+        recency_mult = 0.6
+    else:
+        recency_mult = 0.35
+
+    source_boost = SOURCE_AUTHORITY.get(item.get("source", ""), 1.5)
+    return max(importance, 0.0) * recency_mult + source_boost
+
+
+def _score_football_article(item: dict) -> float:
+    """Score football article using multiplicative recency (72-hr window).
+
+    Formula: max(importance, 0) * recency_multiplier + source_authority
+    """
+    title = item.get("title", "").lower()
+    desc  = item.get("description", "").lower()
+    pub   = item.get("published", "")
+    importance = 0.0
+
+    # Football importance signals — title match worth far more than description
+    for kw in FOOTBALL_IMPORTANCE_SIGNALS:
+        if kw in title:
+            importance += 10.0
+        elif kw in desc:
+            importance += 4.0
+
+    for kw in BREAKING_SIGNALS:
+        if kw in title:
+            importance += 10.0
+            break
+
+    # Transfer fee / prize money magnitude
+    if _BIG_MONEY_RE.search(title):
+        importance += 12.0
+    elif _BIG_MONEY_RE.search(desc):
+        importance += 5.0
+
+    # Soft-news penalty
+    if _SOFT_NEWS_RE.search(title):
+        importance -= 20.0
+
+    # Recency multiplier — 72hr window so last 2-3 days of results surface
+    age_h = None
+    if pub:
+        try:
+            age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(pub)).total_seconds() / 3600
+        except Exception:
+            pass
+    if age_h is None:
+        recency_mult = 0.5
+    elif age_h < 6:
+        recency_mult = 2.2
+    elif age_h < 24:
+        recency_mult = 1.6
+    elif age_h < 48:
+        recency_mult = 1.0
+    elif age_h < 72:
+        recency_mult = 0.6
+    else:
+        recency_mult = 0.2
+
+    source_boost = SOURCE_AUTHORITY.get(item.get("source", ""), 1.5)
+    return max(importance, 0.0) * recency_mult + source_boost
 
 
 def _score_ai_article(item: dict) -> float:
@@ -421,24 +677,72 @@ def _fetch_all_feeds(category: str) -> list[dict]:
             except Exception:
                 pass
 
+    # Build cross-source fingerprints + source names for multi-outlet detection
+    all_fingerprints = [_title_fingerprint(item["title"]) for item in all_items]
+    all_sources      = [item.get("source", "") for item in all_items]
+
     # Deduplicate by title similarity
     seen_titles: set[str] = set()
     unique: list[dict] = []
+    unique_indices: list[int] = []  # track original indices for cross-source lookup
     is_ai = category == "ai_research"
-    for item in all_items:
+    is_football = category == "football"
+    for idx, item in enumerate(all_items):
         key = re.sub(r"\W+", "", item["title"].lower())[:50]
         if key not in seen_titles:
             seen_titles.add(key)
             if is_ai:
                 item["tag"] = _tag_ai_article(item)
                 item["score"] = _score_ai_article(item)
+            elif is_football:
+                item["tag"] = _tag_article(item)
+                item["score"] = _score_football_article(item)
             else:
                 item["tag"] = _tag_article(item)
                 item["score"] = _score_article(item)
             unique.append(item)
+            unique_indices.append(idx)
 
-    # Sort by score (highest first), then by date
-    unique.sort(key=lambda x: (x.get("score", 0), x.get("published", "")), reverse=True)
+    # Cross-source boost: stories covered by DIFFERENT outlets are more important.
+    # Same-feed duplicates are excluded so the signal reflects true editorial consensus.
+    if not is_ai:
+        for i, item in enumerate(unique):
+            fp          = all_fingerprints[unique_indices[i]]
+            item_source = all_sources[unique_indices[i]]
+            if len(fp) < 2:
+                continue
+            seen_cross_sources: set[str] = set()
+            for j, (other_fp, other_src) in enumerate(zip(all_fingerprints, all_sources)):
+                if (j != unique_indices[i]
+                        and other_src != item_source          # must be a different outlet
+                        and other_src not in seen_cross_sources
+                        and len(other_fp) > 0
+                        and len(fp & other_fp) / max(len(fp), len(other_fp)) >= 0.35):
+                    seen_cross_sources.add(other_src)
+            cross_count = len(seen_cross_sources)
+            if cross_count > 0:
+                # Non-linear: 3rd independent outlet covering same story = very strong signal
+                boost = min(cross_count * 5.0, 20.0)
+                item["score"] = item.get("score", 0) + boost
+
+    # Sort: for top_news, guarantee last-24hr articles always appear before older ones.
+    # Within each freshness bucket, sort by score descending.
+    if category == "top_news":
+        now_utc = datetime.now(timezone.utc)
+        def _top_news_key(x):
+            pub = x.get("published", "")
+            fresh = False
+            if pub:
+                try:
+                    age_h = (now_utc - datetime.fromisoformat(pub)).total_seconds() / 3600
+                    fresh = age_h < 24
+                except Exception:
+                    pass
+            return (1 if fresh else 0, x.get("score", 0))
+        unique.sort(key=_top_news_key, reverse=True)
+    else:
+        unique.sort(key=lambda x: (x.get("score", 0), x.get("published", "")), reverse=True)
+
     limit = 50
     result = unique[:limit]
     _set_cache(f"feeds_{category}", result)
@@ -715,18 +1019,26 @@ def api_match(league, event_id):
             "home_away": c.get("homeAway", ""),
         })
 
-    # Boxscore stats (select key ones)
-    STAT_KEYS = [
-        "Possession", "SHOTS", "ON GOAL", "Corner Kicks", "Fouls",
-        "Yellow Cards", "Red Cards", "Offsides", "Saves",
-        "Pass Completion %", "Accurate Passes",
-    ]
+    # Boxscore stats — ESPN API key → friendly display label
+    STAT_KEYS = {
+        "Possession":       "Possession",
+        "SHOTS":            "Total Shots",
+        "ON GOAL":          "Shots on Target",
+        "Corner Kicks":     "Corner Kicks",
+        "Fouls":            "Fouls",
+        "Yellow Cards":     "Yellow Cards",
+        "Red Cards":        "Red Cards",
+        "Offsides":         "Offsides",
+        "Saves":            "Saves",
+        "Pass Completion %":"Pass Completion %",
+        "Accurate Passes":  "Accurate Passes",
+    }
     team_stats = []
     for t in sdata.get("boxscore", {}).get("teams", []):
         stat_map = {s["label"]: s["displayValue"] for s in t.get("statistics", [])}
         team_stats.append({
             "name": t.get("team", {}).get("displayName", "?"),
-            "stats": {k: stat_map.get(k, "-") for k in STAT_KEYS},
+            "stats": {display: stat_map.get(api_key, "-") for api_key, display in STAT_KEYS.items()},
         })
 
     # Key events (goals, cards)
