@@ -279,6 +279,12 @@
       .then((r) => r.json())
       .then((data) => {
         if (data.error) {
+          // If site blocks server-side fetching, open directly in browser
+          if (data.error === "blocked") {
+            closeReader();
+            window.open(data.source_url || url, "_blank", "noopener");
+            return;
+          }
           readerBody.innerHTML = `<div class="reader-error">
             <p>Could not parse this article.</p>
             <p><a href="${url}" target="_blank" rel="noopener">Open in browser instead</a></p>
@@ -304,8 +310,9 @@
         metaParts.push(`<span>${new URL(url).hostname}</span>`);
         html += `<div class="reader-meta">${metaParts.join('<span style="color:var(--border-h)">|</span>')}</div>`;
 
-        // Convert text paragraphs to HTML
-        const paragraphs = data.text.split(/\n{2,}/);
+        // Decode HTML entities and convert text paragraphs to HTML
+        const decoded = data.text.replace(/&#x27;/g, "'").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"');
+        const paragraphs = decoded.split(/\n{2,}/).filter((p) => p.trim().length > 0);
         html += `<div class="reader-text">${paragraphs.map((p) => `<p>${p.trim()}</p>`).join("")}</div>`;
 
         // Extra images (skip top_image)

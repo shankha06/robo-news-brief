@@ -13,18 +13,19 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 # Copy dependency files first (layer caching)
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies (no venv needed inside container)
+# Install dependencies
 RUN uv sync --frozen --no-dev
+
+# Pre-download nltk data needed by newspaper4k (avoids runtime delay)
+RUN uv run python -c "import nltk; nltk.download('punkt_tab', quiet=True)"
 
 # Copy app code
 COPY app.py ./
 COPY templates/ templates/
 COPY static/ static/
 
-# Production settings
-ENV PORT=8080
 ENV FLASK_DEBUG=0
 
-EXPOSE 8080
-
-CMD ["uv", "run", "gunicorn", "app:app", "--bind", "0.0.0.0:8080", "--workers", "2", "--threads", "4", "--timeout", "120"]
+# Use shell form so $PORT is expanded at runtime
+# Render sets PORT=10000, other platforms may differ
+CMD uv run gunicorn app:app --bind "0.0.0.0:${PORT:-8080}" --workers 2 --threads 4 --timeout 120

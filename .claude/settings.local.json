@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:robo-news-brief.onrender.com)",
+      "Bash(dpkg -l)",
+      "Bash(npx --version)",
+      "Bash(flatpak list:*)",
+      "Read(//usr/bin/**)",
+      "Bash(/opt/google/chrome/google-chrome --headless=new --disable-gpu --no-sandbox --screenshot=\"/media/roy/WDBlue/Codes/robo-news-brief/assets/screenshots/dashboard-full.png\" --window-size=1440,900 --hide-scrollbars \"https://robo-news-brief.onrender.com/\")",
+      "Bash(/opt/google/chrome/google-chrome --headless=new --disable-gpu --no-sandbox --virtual-time-budget=15000 --screenshot=\"/media/roy/WDBlue/Codes/robo-news-brief/assets/screenshots/dashboard-full.png\" --window-size=1440,900 --hide-scrollbars \"https://robo-news-brief.onrender.com/\")"
+    ]
+  }
+}

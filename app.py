@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Daily Chore Dashboard - Personal news, stocks & search aggregator."""
 
+import json
 import os
 import re
 import time
@@ -85,7 +86,14 @@ STOCK_SYMBOLS = {
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                  "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
 }
 
 # Simple in-memory cache
@@ -756,6 +764,78 @@ def api_match(league, event_id):
     return jsonify(result)
 
 
+def _extract_ld_json(html: str) -> dict | None:
+    """Extract article data from LD+JSON structured data embedded in HTML."""
+    ld_blocks = re.findall(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, re.DOTALL,
+    )
+    for block in ld_blocks:
+        try:
+            data = json.loads(block)
+            # Handle @graph arrays
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                atype = item.get("@type", "")
+                if atype in ("NewsArticle", "Article", "ReportageNewsArticle",
+                             "WebPage") or "Article" in str(atype):
+                    body = item.get("articleBody", "")
+                    if body and len(body) > 100:
+                        # Extract structured fields
+                        authors = []
+                        raw_author = item.get("author", [])
+                        if isinstance(raw_author, dict):
+                            raw_author = [raw_author]
+                        if isinstance(raw_author, list):
+                            for a in raw_author:
+                                if isinstance(a, dict):
+                                    authors.append(a.get("name", ""))
+                                elif isinstance(a, str):
+                                    authors.append(a)
+
+                        img = ""
+                        raw_img = item.get("image", item.get("thumbnailUrl", ""))
+                        if isinstance(raw_img, dict):
+                            img = raw_img.get("url", "")
+                        elif isinstance(raw_img, list) and raw_img:
+                            first = raw_img[0]
+                            img = first.get("url", "") if isinstance(first, dict) else str(first)
+                        elif isinstance(raw_img, str):
+                            img = raw_img
+
+                        pub = item.get("datePublished", "")
+
+                        return {
+                            "title": item.get("headline", ""),
+                            "authors": [a for a in authors if a],
+                            "publish_date": pub,
+                            "top_image": img,
+                            "text": body,
+                        }
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return None
+
+
+def _extract_og_meta(html: str) -> dict:
+    """Extract Open Graph / meta tag fallback info."""
+    def _meta(prop):
+        m = re.search(
+            rf'<meta[^>]*(?:property|name)=["\'](?:og:)?{prop}["\'][^>]*content=["\']([^"\']+)',
+            html, re.I,
+        )
+        return m.group(1) if m else ""
+    return {
+        "title": _meta("title"),
+        "description": _meta("description"),
+        "image": _meta("image"),
+        "author": _meta("author"),
+        "published_time": _meta("article:published_time"),
+    }
+
+
 @app.route("/api/article")
 def api_article():
     """Fetch and parse a full article from its URL."""
@@ -773,37 +853,87 @@ def api_article():
     if cached is not None:
         return jsonify(cached)
 
-    # Special handling for arXiv — extract abstract from the abs page
+    # Special handling for arXiv
     if "arxiv.org" in url:
         return _parse_arxiv_article(url, cache_key)
 
     try:
-        article = Article(url, headers=HEADERS)
-        article.download()
-        article.parse()
+        # First, fetch the raw HTML ourselves for LD+JSON / meta extraction
+        raw_resp = requests.get(url, headers=HEADERS, timeout=12)
 
-        text = article.text or ""
+        # Some sites (NDTV, etc.) block server-side requests
+        if raw_resp.status_code in (403, 451):
+            return jsonify({"error": "blocked", "source_url": url}), 502
 
-        # If newspaper4k got too little text, try a fallback with requests + basic extraction
+        raw_html = raw_resp.text
+
+        title = ""
+        authors: list[str] = []
+        pub_date = ""
+        top_image = ""
+        images: list[str] = []
+        text = ""
+
+        # Strategy 1: LD+JSON structured data (most reliable for modern sites)
+        ld = _extract_ld_json(raw_html)
+        if ld and len(ld.get("text", "")) > 100:
+            title = ld["title"]
+            authors = ld["authors"]
+            pub_date = ld["publish_date"]
+            top_image = ld["top_image"]
+            text = ld["text"]
+
+        # Strategy 2: newspaper4k (good general parser)
+        if len(text) < 100:
+            try:
+                article = Article(url, headers=HEADERS)
+                article.html = raw_html
+                article.parse()
+                if len(article.text or "") > len(text):
+                    text = article.text
+                if not title:
+                    title = article.title or ""
+                if not authors and article.authors:
+                    authors = article.authors
+                if not pub_date and article.publish_date:
+                    pub_date = article.publish_date.isoformat()
+                if not top_image:
+                    top_image = article.top_image or ""
+                for img in article.images:
+                    if img not in images and img != top_image:
+                        images.append(img)
+                    if len(images) >= 4:
+                        break
+            except Exception:
+                pass
+
+        # Strategy 3: Regex fallback for <article>/<p> extraction
         if len(text.strip()) < 100:
-            text = _fallback_extract(url) or text
+            text = _fallback_extract_from_html(raw_html) or text
 
-        # Collect images: top_image first, then any others (deduplicated)
-        images = []
-        if article.top_image:
-            images.append(article.top_image)
-        for img in article.images:
-            if img not in images:
-                images.append(img)
-            if len(images) >= 5:
-                break
+        # Fill missing metadata from OG meta tags
+        og = _extract_og_meta(raw_html)
+        if not title:
+            title = og["title"]
+        if not top_image:
+            top_image = og["image"]
+        if not pub_date:
+            pub_date = og["published_time"]
+        if not authors and og["author"]:
+            authors = [og["author"]]
+
+        if top_image and top_image not in images:
+            images.insert(0, top_image)
+
+        if not text or len(text.strip()) < 50:
+            return jsonify({"error": "blocked", "source_url": url}), 502
 
         result = {
-            "title": article.title or "",
-            "authors": article.authors or [],
-            "publish_date": article.publish_date.isoformat() if article.publish_date else "",
-            "top_image": article.top_image or "",
-            "images": images,
+            "title": title,
+            "authors": authors,
+            "publish_date": pub_date,
+            "top_image": top_image,
+            "images": images[:5],
             "text": text,
             "source_url": url,
         }
@@ -859,23 +989,18 @@ def _parse_arxiv_article(url: str, cache_key: str):
         return jsonify({"error": f"Failed to parse arXiv article: {str(e)}"}), 502
 
 
-def _fallback_extract(url: str) -> str:
-    """Fallback text extraction using requests + regex for stubborn sites."""
+def _fallback_extract_from_html(html: str) -> str:
+    """Fallback text extraction using regex on pre-fetched HTML."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=12)
-        html = resp.text
-
         # Try to find <article> tag content
         m = re.search(r"<article[^>]*>(.*?)</article>", html, re.DOTALL)
         if not m:
-            # Try main content area
             m = re.search(
                 r'<div[^>]*(?:class|id)=["\'][^"\']*(?:article|story|content|post)[^"\']*["\'][^>]*>(.*?)</div>',
                 html, re.DOTALL,
             )
         if m:
             content = m.group(1)
-            # Extract text from <p> tags
             paragraphs = re.findall(r"<p[^>]*>(.*?)</p>", content, re.DOTALL)
             text = "\n\n".join(
                 re.sub(r"<[^>]+>", "", p).strip() for p in paragraphs if len(p.strip()) > 30
