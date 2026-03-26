@@ -52,10 +52,15 @@ RSS_FEEDS = {
         ("arXiv CS.AI", "https://rss.arxiv.org/rss/cs.AI"),
         ("arXiv CS.LG", "https://rss.arxiv.org/rss/cs.LG"),
         ("arXiv CS.IR", "https://rss.arxiv.org/rss/cs.IR"),
-        # Top AI blogs
-        ("Google AI", "https://blog.research.google/feeds/posts/default?alt=rss"),
+        # Frontier AI lab blogs
         ("OpenAI", "https://openai.com/blog/rss.xml"),
         ("Anthropic", "https://www.anthropic.com/rss/research.rss"),
+        ("Google AI", "https://blog.research.google/feeds/posts/default?alt=rss"),
+        ("DeepMind", "https://deepmind.google/blog/rss.xml"),
+        ("Mistral", "https://mistral.ai/blog-rss.xml"),
+        ("Nvidia AI", "https://blogs.nvidia.com/feed/"),
+        ("Microsoft Research", "https://www.microsoft.com/en-us/research/blog/feed/"),
+        # Expert blogs
         ("HuggingFace", "https://huggingface.co/blog/feed.xml"),
         ("The Gradient", "https://thegradient.pub/rss/"),
         ("Lil'Log", "https://lilianweng.github.io/index.xml"),
@@ -166,6 +171,11 @@ SOURCE_AUTHORITY = {
     "Google Transfer News": 1.0,
     "Google Jobs/Layoffs": 1.0,
     "Google AI News": 1.5,
+    # AI lab / research blogs
+    "DeepMind": 6.0,
+    "Mistral": 5.0,
+    "Nvidia AI": 5.0,
+    "Microsoft Research": 5.0,
 }
 
 # Hard-news action verbs in title — something actually HAPPENED (not just discussed)
@@ -191,7 +201,24 @@ _SOFT_NEWS_RE = re.compile(
     r'|\bwatch\s*:'
     r'|\bin\s+pictures\b'
     r'|weekly\s+(?:roundup|wrap)'
-    r'|monthly\s+digest',
+    r'|monthly\s+digest'
+    # Analysis/explainer formats not tagged explicitly
+    r'|\ball\s+about\s+(?:the|how|why|what)\b'
+    r'|\bwhy\s+(?:is|are|did|does|the|india|pakistan|china|us|iran)\b'
+    r'|\bhow\s+(?:\w+\s+){1,3}(?:is|are)\s+(?:driving|reshaping|affecting|impacting|changing|redefining)\b'
+    r'|\bwhat\s+(?:it\s+means|you\s+should|this\s+means|experts\s+say|the\s+data)\b'
+    r'|\bwhat\s+\w+\s+must\s+do\b'
+    r'|\bwhat\s+to\s+(?:look\s+out|expect|know|watch)\b'
+    r'|\bfiscal\s+math\b',
+    re.IGNORECASE,
+)
+
+# LIVE blog/update articles — constantly-updating but less useful as discrete news
+_LIVE_BLOG_RE = re.compile(
+    r'\blive\s*(?:updates?|blog|ticker|news|coverage)\s*[:\-]?'
+    r'|\blive\s*:\s'
+    r'|\bday\s+\d+\s+live\b'
+    r'|\bfollowing\s+live\b',
     re.IGNORECASE,
 )
 
@@ -210,10 +237,12 @@ _MARKET_MOVE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Breaking/urgency signals — used by editors only for genuinely major stories
+# Breaking/urgency signals — used by editors only for genuinely major stories.
+# "live updates" / "live:" deliberately excluded: they're chronic live-blog markers,
+# not one-time breaking news; they get their own penalty in _LIVE_BLOG_RE.
 BREAKING_SIGNALS = [
     "breaking", "breaking news", "just in", "urgent", "alert", "developing",
-    "live updates", "live:", "flash:", "exclusive:", "at this hour",
+    "flash:", "exclusive:", "at this hour",
 ]
 
 # High-impact importance signals — scale, severity, historic nature
@@ -238,6 +267,27 @@ IMPORTANCE_SIGNALS = [
     "resignation", "resigned", "ousted", "coup", "impeached", "fired",
     "invasion", "attack", "war declared", "ceasefire declared",
 ]
+
+# Football match outcome detection — distinguishes results from previews.
+# Use past/completed forms only: "wins" (3rd person result), not "win" (infinitive preview).
+# "beat X 2-0" = result; "must beat X" = preview — avoid infinitive forms.
+_FOOTBALL_OUTCOME_RE = re.compile(
+    r'\b(?:\d\s*[-–]\s*\d|wins\b|win\s+\d|loses?\b|beaten\b|'
+    r'victory\b|defeats?\b|thrash(?:es)?\b|hammer(?:s)?\b|demolish(?:es)?\b|'
+    r'knocked\s+out\b|eliminat(?:ed|es)\b|relegated\b|promoted\b|'
+    r'champions\b|title\s+winner|final\s+score|full[- ]time|ft:|'
+    r'hat[- ]trick|brace\b|own\s+goal|penalty\s+shootout|extra\s+time)\b',
+    re.IGNORECASE,
+)
+
+# Major competitions — presence elevates importance
+_FOOTBALL_COMPETITIONS_RE = re.compile(
+    r'\b(?:premier\s+league|champions\s+league|la\s+liga|bundesliga|serie\s+a|'
+    r'ligue\s+1|europa\s+league|conference\s+league|fa\s+cup|carabao\s+cup|'
+    r'world\s+cup|euro\s+20\d{2}|copa\s+america|supercopa|dfb[- ]pokal|'
+    r'community\s+shield|isl|afc\s+champions)\b',
+    re.IGNORECASE,
+)
 
 # Football-specific importance signals
 FOOTBALL_IMPORTANCE_SIGNALS = [
@@ -267,19 +317,84 @@ FOOTBALL_IMPORTANCE_SIGNALS = [
     "returns from injury", "retirement announced", "retires",
 ]
 
-# AI/ML keywords for scoring research articles
-AI_PRIORITY_KEYWORDS = [
-    "llm", "large language model", "gpt", "transformer", "attention",
-    "reinforcement learning", "rlhf", "rl", "ppo", "reward model",
-    "retrieval", "rag", "dense retrieval", "vector search", "embedding",
-    "ranking", "learning to rank", "recommendation", "reranking",
-    "agent", "tool use", "function calling", "multi-agent", "agentic",
-    "fine-tuning", "lora", "qlora", "instruction tuning",
-    "reasoning", "chain of thought", "cot", "tree of thought",
-    "diffusion", "multimodal", "vision language", "mllm",
-    "benchmark", "evaluation", "scaling law",
-    "claude", "gemini", "llama", "mistral", "openai", "anthropic", "deepmind",
-]
+# AI/ML weighted keyword dict — specific/rare terms score far higher than broad ones.
+# Weights represent editorial signal strength: frontier model names score highest,
+# generic terms like "ai" very low to prevent inflation.
+AI_HIGH_IMPACT_KEYWORDS = {
+    # Frontier model names — very high signal, almost always newsworthy
+    "gpt-5": 8.0, "gpt-4o": 5.0, "o3": 6.0, "o4": 7.0,
+    "claude 4": 8.0, "claude 3.7": 6.0, "claude 3.5": 5.0,
+    "gemini 2.0": 6.0, "gemini ultra": 6.0, "gemini 2.5": 7.0,
+    "llama 4": 7.0, "llama 3": 4.0,
+    "deepseek r2": 7.0, "deepseek v3": 6.0, "deepseek r1": 5.0,
+    "grok 3": 6.0, "grok 2": 4.0,
+    "mistral large": 5.0, "mistral small": 3.0,
+    # High-impact techniques / milestones
+    "state of the art": 4.0, "sota": 3.5, "outperforms": 3.0, "surpasses": 3.0,
+    "beats gpt": 5.0, "beats claude": 5.0, "beats gemini": 5.0,
+    "constitutional ai": 4.0, "alignment": 3.0, "safety": 2.0,
+    "rlhf": 2.5, "dpo": 2.0, "grpo": 2.5, "reward model": 2.5,
+    "chain of thought": 3.0, "reasoning": 2.5, "step-by-step": 2.0,
+    "multimodal": 2.5, "vision language": 3.0, "mllm": 2.5,
+    "agentic": 3.0, "multi-agent": 3.0, "tool use": 2.0, "function calling": 2.0,
+    "scaling law": 3.5, "emergent": 3.0, "emergent capabilities": 4.0,
+    "jailbreak": 3.0, "prompt injection": 3.0, "hallucination": 2.0,
+    "rag": 2.0, "retrieval augmented": 3.0, "vector search": 2.0,
+    "diffusion": 2.0, "text-to-image": 2.0, "text-to-video": 3.0,
+    "benchmark": 1.5, "mmlu": 3.0, "humaneval": 3.0, "swe-bench": 3.5,
+    "lora": 1.5, "qlora": 2.0, "instruction tuning": 2.0, "fine-tuning": 1.5,
+    # Moderate signal — important but very common in arXiv papers
+    "reinforcement learning": 1.5, "large language model": 1.0,
+    "open source": 1.5, "open-source": 1.5,
+    "llm": 0.8, "gpt": 1.5, "transformer": 0.8, "attention mechanism": 1.5,
+    # Common arXiv paper topics — low weight to prevent inflation
+    "agent": 0.8, "embedding": 0.5, "retrieval": 0.5,
+    "rag": 0.8, "retrieval augmented": 1.2, "vector search": 1.0,
+    "multi-agent": 1.5, "benchmark": 0.8,
+    # Very broad terms (very low weight)
+    "neural network": 0.3, "machine learning": 0.3, "deep learning": 0.3,
+    "ai": 0.2, "artificial intelligence": 0.3, "ml": 0.2,
+}
+
+# Source authority tiers for AI articles — lab blogs >> expert >> arXiv >> aggregator
+AI_SOURCE_TIERS = {
+    # Tier 1: frontier labs — primary source of groundbreaking work
+    "OpenAI": 8.0, "Anthropic": 8.0, "DeepMind": 8.0,
+    "Google AI": 7.0, "Mistral": 6.0, "Nvidia AI": 6.0, "Microsoft Research": 6.0,
+    # Tier 2: high-quality expert blogs
+    "Lil'Log": 6.0, "The Gradient": 5.0, "HuggingFace": 5.0,
+    # Tier 3: arXiv (high volume, variable quality)
+    "arXiv CS.CL": 2.0, "arXiv CS.AI": 2.0, "arXiv CS.LG": 2.0, "arXiv CS.IR": 1.5,
+    # Tier 4: aggregated/curated news
+    "Google AI News": 1.5,
+}
+
+# SOTA / breakthrough detection — something genuinely novel happened
+_AI_SOTA_RE = re.compile(
+    r'\b(?:state[- ]of[- ]the[- ]art|sota|outperforms?|surpasses?|'
+    r'beats?\s+(?:gpt|claude|gemini|llama)|new\s+record|best[- ]in[- ]class|'
+    r'first\s+to\s+achieve|breakthrough|game[- ]changing|unprecedented\s+performance)\b',
+    re.IGNORECASE,
+)
+
+# Novel work signals — paper/model introduction vs discussion
+_AI_NOVEL_RE = re.compile(
+    r'\b(?:we\s+(?:introduce|present|propose)|introducing\b|novel\s+approach|'
+    r'new\s+(?:method|framework|model|architecture)|(?:releases?|released|open[- ]source[sd])\b)\b',
+    re.IGNORECASE,
+)
+
+# Noise / low-value content — roundups, tutorials, getting-started guides
+_AI_NOISE_RE = re.compile(
+    r'\b(?:weekly\s+(?:digest|roundup|recap|wrap)|top\s+\d+\s+(?:papers?|tools?|models?|concepts?)|'
+    r'getting\s+started|cheat\s+sheet|beginner(?:\'s)?\s+guide|'
+    r'introduction\s+to\b|overview\s+of\b|course\s+(?:review|summary)|'
+    r'paper\s+summary|papers\s+this\s+week|this\s+week\s+in\s+ai|'
+    r'what\s+(?:is|are)\s+(?:a\s+|an\s+)?(?:llm|large\s+language|generative\s+ai|rag|ai\s+agent)|'
+    r'\w+\s+explained\s+in\s+under\s+\d+|'
+    r'\d+\s+\w+\s+(?:concepts?|techniques?|methods?)\s+explained)\b',
+    re.IGNORECASE,
+)
 
 CATEGORY_TAGS = {
     "Finance": ["market crash", "stock market", "sensex", "nifty", "bank nifty",
@@ -348,15 +463,25 @@ AI_CATEGORY_TAGS = {
 
 
 def _title_fingerprint(title: str) -> frozenset:
-    """Extract key content words from title for cross-source story clustering."""
+    """Extract key content words from title for cross-source story clustering.
+
+    Strips trailing source attributions (e.g. '| India News', '| Hindustan Times')
+    that RSS feeds append — these inflate the fingerprint with outlet-specific noise
+    and lower the overlap ratio between articles covering the same story.
+    """
     STOP = {
         "the", "a", "an", "is", "are", "was", "were", "be", "been", "to", "of",
         "in", "on", "at", "for", "with", "by", "from", "and", "or", "but", "not",
         "as", "it", "its", "he", "she", "they", "we", "i", "this", "that", "which",
         "who", "has", "have", "had", "will", "would", "could", "should", "after",
         "before", "over", "under", "up", "down", "says", "said", "says",
+        # Outlet noise words that appear in RSS title suffixes
+        "news", "times", "post", "herald", "tribune", "express", "live", "today",
+        "india", "daily", "online",
     }
-    words = re.findall(r'\b[a-z]+\b', title.lower())
+    # Strip trailing source attributions added by feeds: " | India News", " | Hindustan Times"
+    clean = re.sub(r'\s*\|\s*.+$', '', title)
+    words = re.findall(r'\b[a-z]+\b', clean.lower())
     return frozenset(w for w in words if w not in STOP and len(w) > 2)
 
 
@@ -388,12 +513,15 @@ def _score_article(item: dict) -> float:
             importance += 10.0
             break
 
-    # High-impact event signals — title match worth much more than description
+    # High-impact event signals — title match worth much more than description.
+    # "record high/low" separated: it fires too broadly (UK school attendance, stock records)
+    # and shouldn't score the same as plane crashes or market collapses.
+    BROAD_RECORD_SIGNALS = {"record high", "record low", "all-time high", "all-time low"}
     for kw in IMPORTANCE_SIGNALS:
         if kw in title:
-            importance += 8.0
+            importance += 4.0 if kw in BROAD_RECORD_SIGNALS else 8.0
         elif kw in desc:
-            importance += 3.0
+            importance += 1.5 if kw in BROAD_RECORD_SIGNALS else 3.0
 
     # Hard-news action verb in title: something actually HAPPENED
     if _HARD_NEWS_VERB_RE.search(title):
@@ -411,9 +539,14 @@ def _score_article(item: dict) -> float:
     if _MARKET_MOVE_RE.search(title):
         importance += 8.0
 
-    # Soft-news penalty — drags importance below 0 so recency can't rescue it
+    # Soft-news / analysis penalty — drags importance below 0 so recency can't rescue it
     if _SOFT_NEWS_RE.search(title):
         importance -= 20.0
+
+    # LIVE blog penalty: live-blogs are constantly updated aggregations, not discrete news.
+    # Strong penalty so they rank well below individual news reports of the same story.
+    if _LIVE_BLOG_RE.search(title):
+        importance -= 15.0
 
     # Hyperlocal foreign penalty
     text = title + " " + desc
@@ -424,30 +557,32 @@ def _score_article(item: dict) -> float:
     if any(lf in text for lf in local_foreign) and "india" not in text:
         importance -= 25.0
 
-    # Recency multiplier — proportionally amplifies importance, not a flat add.
-    # Result: a trivially important article stays trivially important even when fresh.
+    # Recency: no time-based priority for top stories — importance alone determines rank.
+    # Exception: confirmed breaking news (matched BREAKING_SIGNALS above) gets a recency
+    # boost so genuinely unfolding emergencies surface quickly.
+    is_breaking = any(kw in title for kw in BREAKING_SIGNALS)
     age_h = None
     if pub:
         try:
             age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(pub)).total_seconds() / 3600
         except Exception:
             pass
-    if age_h is None:
-        recency_mult = 0.7
-    elif age_h < 1:
-        recency_mult = 2.5
-    elif age_h < 3:
-        recency_mult = 2.0
-    elif age_h < 6:
-        recency_mult = 1.6
-    elif age_h < 12:
-        recency_mult = 1.3
-    elif age_h < 24:
-        recency_mult = 1.0
-    elif age_h < 48:
-        recency_mult = 0.6
+
+    if is_breaking:
+        if age_h is None:
+            recency_mult = 0.7
+        elif age_h < 1:
+            recency_mult = 2.5
+        elif age_h < 3:
+            recency_mult = 2.0
+        elif age_h < 6:
+            recency_mult = 1.6
+        elif age_h < 12:
+            recency_mult = 1.3
+        else:
+            recency_mult = 1.0
     else:
-        recency_mult = 0.35
+        recency_mult = 1.0  # flat — rank by importance only
 
     source_boost = SOURCE_AUTHORITY.get(item.get("source", ""), 1.5)
     return max(importance, 0.0) * recency_mult + source_boost
@@ -457,6 +592,12 @@ def _score_football_article(item: dict) -> float:
     """Score football article using multiplicative recency (72-hr window).
 
     Formula: max(importance, 0) * recency_multiplier + source_authority
+
+    Key design choices:
+    - Recency multipliers deliberately low (max 1.3) so that a genuinely
+      important older result is never buried by a trivial fresh preview.
+    - Outcome amplifier: competition + confirmed result × 2.5 importance.
+      A CL final result from 36h ago should always beat a CL preview from 1h ago.
     """
     title = item.get("title", "").lower()
     desc  = item.get("description", "").lower()
@@ -481,11 +622,21 @@ def _score_football_article(item: dict) -> float:
     elif _BIG_MONEY_RE.search(desc):
         importance += 5.0
 
-    # Soft-news penalty
+    # Outcome amplifier: article confirmed a match result in a major competition.
+    # A result article is always more important than a preview of the same match.
+    has_outcome = bool(_FOOTBALL_OUTCOME_RE.search(title))
+    has_competition = bool(_FOOTBALL_COMPETITIONS_RE.search(title) or _FOOTBALL_COMPETITIONS_RE.search(desc))
+    if has_outcome and has_competition:
+        importance *= 2.5
+    elif has_outcome:
+        importance *= 1.5
+
+    # Soft-news penalty (previews, opinion, listicles)
     if _SOFT_NEWS_RE.search(title):
         importance -= 20.0
 
-    # Recency multiplier — 72hr window so last 2-3 days of results surface
+    # Recency multiplier — kept deliberately low to prevent fresh previews
+    # from outranking important older results. Max 1.3 (was 2.2).
     age_h = None
     if pub:
         try:
@@ -495,11 +646,11 @@ def _score_football_article(item: dict) -> float:
     if age_h is None:
         recency_mult = 0.5
     elif age_h < 6:
-        recency_mult = 2.2
+        recency_mult = 1.3
     elif age_h < 24:
-        recency_mult = 1.6
+        recency_mult = 1.1
     elif age_h < 48:
-        recency_mult = 1.0
+        recency_mult = 0.9
     elif age_h < 72:
         recency_mult = 0.6
     else:
@@ -510,35 +661,82 @@ def _score_football_article(item: dict) -> float:
 
 
 def _score_ai_article(item: dict) -> float:
-    """Score an AI research article. Higher = more relevant."""
-    text = (item.get("title", "") + " " + item.get("description", "")).lower()
-    score = 0.0
+    """Score an AI research/blog article using multiplicative recency (3-month window).
 
-    for kw in AI_PRIORITY_KEYWORDS:
-        if kw in text:
-            score += 3.0
+    Formula: max(importance, 0) * recency_multiplier + source_tier
 
-    # Boost recent
-    pub = item.get("published", "")
+    Design:
+    - Title-biased keywords (title = 3× weight) so frontier model announcements
+      that lead with the model name score far above generic arXiv papers.
+    - SOTA/breakthrough regex boosts breakthrough results.
+    - Noise penalty collapses roundups/tutorials below the floor.
+    - 3-month recency window: important older papers still surface above fresh noise.
+    """
+    title = item.get("title", "").lower()
+    desc  = item.get("description", "").lower()
+    pub   = item.get("published", "")
+    source = item.get("source", "")
+    importance = 0.0
+
+    # Title-biased weighted keyword scoring.
+    # Keyword importance is capped at 12 to prevent keyword-rich arXiv titles
+    # from dominating; SOTA/novel signals (below) push past the cap.
+    kw_importance = 0.0
+    for kw, weight in AI_HIGH_IMPACT_KEYWORDS.items():
+        if kw in title:
+            kw_importance += weight * 3.0
+        elif kw in desc:
+            kw_importance += weight * 0.8
+    importance += min(kw_importance, 12.0)
+
+    # SOTA / breakthrough detection
+    if _AI_SOTA_RE.search(title):
+        importance += 8.0
+    elif _AI_SOTA_RE.search(desc):
+        importance += 3.0
+
+    # Novel work (paper/model release) — "we introduce / releasing / open-sourced"
+    if _AI_NOVEL_RE.search(title):
+        importance += 5.0
+
+    # arXiv papers without any SOTA or novel signal are likely routine submissions.
+    # Apply a penalty so they don't rank above genuine announcements.
+    is_arxiv = source.startswith("arXiv")
+    has_signal = _AI_SOTA_RE.search(title) or _AI_NOVEL_RE.search(title)
+    if is_arxiv and not has_signal:
+        importance -= 6.0
+
+    # Noise penalty — roundups, tutorials, getting-started guides
+    if _AI_NOISE_RE.search(title):
+        importance -= 15.0
+    if _SOFT_NEWS_RE.search(title):
+        importance -= 10.0
+
+    # Recency multiplier — 3-month window (2160 hr).
+    # Max 2.0 so a breakthrough from last week still beats fresh trivia.
+    age_h = None
     if pub:
         try:
-            age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(pub)).total_seconds() / 3600
-            if age_hours < 24:
-                score += 4.0
-            elif age_hours < 72:
-                score += 2.0
-            elif age_hours < 168:
-                score += 1.0
+            age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(pub)).total_seconds() / 3600
         except Exception:
             pass
+    if age_h is None:
+        recency_mult = 0.5
+    elif age_h < 24:
+        recency_mult = 2.0
+    elif age_h < 72:       # up to 3 days
+        recency_mult = 1.5
+    elif age_h < 168:      # up to 1 week
+        recency_mult = 1.2
+    elif age_h < 720:      # up to 1 month
+        recency_mult = 0.9
+    elif age_h < 2160:     # up to 3 months
+        recency_mult = 0.6
+    else:
+        recency_mult = 0.2
 
-    # Boost blog posts from top labs
-    source = item.get("source", "").lower()
-    top_sources = ["openai", "anthropic", "google ai", "huggingface", "deepmind", "lil'log", "the gradient"]
-    if any(s in source for s in top_sources):
-        score += 5.0
-
-    return score
+    source_boost = AI_SOURCE_TIERS.get(item.get("source", ""), 1.5)
+    return max(importance, 0.0) * recency_mult + source_boost
 
 
 def _tag_article(item: dict) -> str:
@@ -700,51 +898,76 @@ def _fetch_all_feeds(category: str) -> list[dict]:
             else:
                 item["tag"] = _tag_article(item)
                 item["score"] = _score_article(item)
+            # Store fingerprint on item so diversity pass stays correct after sorting
+            item["_fp"] = all_fingerprints[idx]
             unique.append(item)
             unique_indices.append(idx)
 
     # Cross-source boost: stories covered by DIFFERENT outlets are more important.
     # Same-feed duplicates are excluded so the signal reflects true editorial consensus.
-    if not is_ai:
-        for i, item in enumerate(unique):
-            fp          = all_fingerprints[unique_indices[i]]
-            item_source = all_sources[unique_indices[i]]
-            if len(fp) < 2:
-                continue
-            seen_cross_sources: set[str] = set()
-            for j, (other_fp, other_src) in enumerate(zip(all_fingerprints, all_sources)):
-                if (j != unique_indices[i]
-                        and other_src != item_source          # must be a different outlet
-                        and other_src not in seen_cross_sources
-                        and len(other_fp) > 0
-                        and len(fp & other_fp) / max(len(fp), len(other_fp)) >= 0.35):
-                    seen_cross_sources.add(other_src)
-            cross_count = len(seen_cross_sources)
-            if cross_count > 0:
-                # Non-linear: 3rd independent outlet covering same story = very strong signal
-                boost = min(cross_count * 5.0, 20.0)
-                item["score"] = item.get("score", 0) + boost
+    # For AI: collapse all arXiv sub-feeds into one logical source so cross-category
+    # arXiv papers don't falsely boost each other (they're the same publisher).
+    def _cross_source_name(src: str) -> str:
+        return "arXiv" if src.startswith("arXiv") else src
 
-    # Sort: for top_news, guarantee last-24hr articles always appear before older ones.
-    # Within each freshness bucket, sort by score descending.
+    for i, item in enumerate(unique):
+        fp          = all_fingerprints[unique_indices[i]]
+        item_source = _cross_source_name(all_sources[unique_indices[i]])
+        if len(fp) < 2:
+            continue
+        seen_cross_sources: set[str] = set()
+        for j, (other_fp, other_src) in enumerate(zip(all_fingerprints, all_sources)):
+            norm_src = _cross_source_name(other_src)
+            if (j != unique_indices[i]
+                    and norm_src != item_source          # must be a different outlet
+                    and norm_src not in seen_cross_sources
+                    and len(other_fp) > 0
+                    # 0.45 threshold requires specific story overlap, not just shared topic words.
+                    # Lower threshold (0.35) caused broad-topic tech articles ("apple security")
+                    # to falsely amplify each other across many outlets.
+                    and len(fp & other_fp) / max(len(fp), len(other_fp)) >= 0.45):
+                seen_cross_sources.add(norm_src)
+        cross_count = len(seen_cross_sources)
+        if cross_count > 0:
+            # Cap at 12: multi-outlet coverage is important but shouldn't dominate over
+            # genuine importance score. 3.0/outlet means 4 outlets = +12, the max.
+            boost = min(cross_count * 3.0, 12.0)
+            item["score"] = item.get("score", 0) + boost
+
+    # Sort by score descending — pure importance ranking, no recency bucket guarantee.
+    unique.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    # Topic-diversity pass for top_news: cap same-topic articles at 3 per cluster
+    # so a single event (e.g. Iran war) doesn't consume the entire top-20.
+    # Fingerprints are stored on items so the pass stays correct after sorting.
     if category == "top_news":
-        now_utc = datetime.now(timezone.utc)
-        def _top_news_key(x):
-            pub = x.get("published", "")
-            fresh = False
-            if pub:
-                try:
-                    age_h = (now_utc - datetime.fromisoformat(pub)).total_seconds() / 3600
-                    fresh = age_h < 24
-                except Exception:
-                    pass
-            return (1 if fresh else 0, x.get("score", 0))
-        unique.sort(key=_top_news_key, reverse=True)
-    else:
-        unique.sort(key=lambda x: (x.get("score", 0), x.get("published", "")), reverse=True)
+        cluster_counts: list[int] = []
+        cluster_fps: list[frozenset] = []
+        diverse: list[dict] = []
+        MAX_PER_CLUSTER = 2
+        for item in unique:
+            fp = item.get("_fp", frozenset())
+            cluster_slot = -1
+            for ci, cfp in enumerate(cluster_fps):
+                if len(fp) > 0 and len(cfp) > 0:
+                    overlap = len(fp & cfp) / max(len(fp), len(cfp))
+                    if overlap >= 0.50:
+                        cluster_slot = ci
+                        break
+            if cluster_slot == -1:
+                cluster_fps.append(fp)
+                cluster_counts.append(1)
+                diverse.append(item)
+            elif cluster_counts[cluster_slot] < MAX_PER_CLUSTER:
+                cluster_counts[cluster_slot] += 1
+                diverse.append(item)
+        unique = diverse
 
     limit = 50
     result = unique[:limit]
+    # Strip internal _fp (frozenset) — not JSON serializable and not needed by the API
+    for item in result:
+        item.pop("_fp", None)
     _set_cache(f"feeds_{category}", result)
     return result
 
