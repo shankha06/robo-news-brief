@@ -1,6 +1,6 @@
 [project]
 name = "brief-news"
-version = "1.6.0"
+version = "2.0.0"
 description = "Automated news aggregation and briefing system that collects financial and general news from multiple sources, processes RSS feeds, and delivers curated summaries"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,4 +13,10 @@ dependencies = [
     "newspaper4k>=0.9.4.1",
     "requests>=2.33.0",
     "yfinance>=1.2.0",
+    # ML ranking pipeline
+    "sentence-transformers>=3.0.0",
+    "lightgbm>=4.0.0",
+    "scikit-learn>=1.4.0",
+    "numpy>=1.26.0",
+    "onnxruntime>=1.17.0",
 ]

@@ -33,6 +33,16 @@
         <span class="live-dot"></span>
         <span class="live-label">LIVE</span>
         <span class="last-updated" id="lastUpdated">--</span>
+        <!-- Dark mode toggle -->
+        <button class="icon-btn" id="themeToggle" title="Toggle dark mode">
+          <svg class="icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+          <svg class="icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+        <!-- Bookmarks -->
+        <button class="icon-btn" id="bookmarksToggle" title="Bookmarks (b)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+          <span class="bookmark-count" id="bookmarkCount" style="display:none">0</span>
+        </button>
         <button class="icon-btn" id="refreshAll" title="Refresh all feeds">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
         </button>
@@ -44,8 +54,8 @@
   <section class="search-section">
     <form class="search-box" id="searchForm" onsubmit="return false;">
       <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-      <input type="text" id="searchInput" class="search-input" placeholder="Search Google..." autocomplete="off" spellcheck="false">
-      <kbd class="search-kbd">Enter</kbd>
+      <input type="text" id="searchInput" class="search-input" placeholder="Search articles or Google..." autocomplete="off" spellcheck="false">
+      <kbd class="search-kbd">/</kbd>
     </form>
   </section>
 
@@ -57,12 +67,12 @@
   </section>
 
   <!-- Main Grid -->
-  <main class="grid-main">
+  <main class="grid-main" id="gridMain">
 
     <!-- Top News -->
-    <section class="col col-news">
+    <section class="col col-news" id="colNews">
       <div class="col-head">
-        <h2 class="col-title">Top Stories</h2>
+        <h2 class="col-title">Top Stories <span class="col-count" id="newsCount"></span></h2>
         <nav class="pill-nav" id="newsFilters">
           <button class="pill active" data-filter="all">All</button>
           <button class="pill" data-filter="Finance">Finance</button>
@@ -83,9 +93,9 @@
     </section>
 
     <!-- Football -->
-    <section class="col col-football">
+    <section class="col col-football" id="colFootball">
       <div class="col-head">
-        <h2 class="col-title">Football</h2>
+        <h2 class="col-title">Football <span class="col-count" id="footballCount"></span></h2>
       </div>
       <div class="col-body scroll-area" id="footballContainer">
         <div class="skeleton-loader">
@@ -98,15 +108,17 @@
     </section>
 
     <!-- AI / ML Research -->
-    <section class="col col-ai">
+    <section class="col col-ai" id="colAi">
       <div class="col-head">
-        <h2 class="col-title">AI Research</h2>
+        <h2 class="col-title">AI Research <span class="col-count" id="aiCount"></span></h2>
         <nav class="pill-nav" id="aiFilters">
           <button class="pill active" data-filter="all">All</button>
           <button class="pill" data-filter="LLM">LLM</button>
           <button class="pill" data-filter="RL">RL</button>
           <button class="pill" data-filter="Agents">Agents</button>
           <button class="pill" data-filter="Retrieval">RAG</button>
+          <button class="pill" data-filter="Vision">Vision</button>
+          <button class="pill" data-filter="Reasoning">Reasoning</button>
         </nav>
       </div>
       <div class="col-body scroll-area" id="aiContainer">
@@ -120,6 +132,18 @@
     </section>
   </main>
 
+  <!-- Trending Papers Banner -->
+  <section class="trending-banner" id="trendingBanner">
+    <div class="trending-banner-inner">
+      <div class="trending-label">TRENDING PAPERS</div>
+      <div class="trending-track-wrap">
+        <div class="trending-track" id="trendingTrack">
+          <span class="trending-placeholder">Loading trending...</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Match Scores Banner -->
   <section class="scores-banner">
     <div class="scores-banner-inner">
@@ -132,16 +156,32 @@
     </div>
   </section>
 
+  <!-- Bookmarks Panel -->
+  <div class="bookmarks-panel" id="bookmarksPanel">
+    <div class="bookmarks-header">
+      <h3 class="bookmarks-title">Reading List</h3>
+      <button class="bookmarks-close" id="bookmarksClose" title="Close">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="bookmarks-body" id="bookmarksBody">
+      <div class="bookmarks-empty">No bookmarks yet. Click the bookmark icon on any article.</div>
+    </div>
+  </div>
+
   <!-- Article Reader Modal -->
   <div class="reader-overlay" id="readerOverlay">
     <div class="reader-modal">
       <div class="reader-chrome">
         <div class="reader-source" id="readerSource"></div>
         <div class="reader-actions">
+          <button class="reader-bookmark-btn" id="readerBookmark" title="Bookmark">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+          </button>
           <a class="reader-ext-link" id="readerExtLink" href="#" target="_blank" rel="noopener" title="Open in new tab">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
           </a>
-          <button class="reader-close-btn" id="readerClose" title="Close">
+          <button class="reader-close-btn" id="readerClose" title="Close (Esc)">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
         </div>
@@ -154,6 +194,16 @@
         </div>
       </div>
     </div>
+  </div>
+
+  <!-- Keyboard shortcut hint -->
+  <div class="kbd-hint" id="kbdHint">
+    <span><kbd>j</kbd><kbd>k</kbd> navigate</span>
+    <span><kbd>o</kbd> open</span>
+    <span><kbd>s</kbd> bookmark</span>
+    <span><kbd>/</kbd> search</span>
+    <span><kbd>b</kbd> bookmarks</span>
+    <span><kbd>?</kbd> shortcuts</span>
   </div>
 
   <!-- Footer -->

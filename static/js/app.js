@@ -1,5 +1,7 @@
 /* =========================================================================
-   Daily Chore Dashboard – Frontend
+   The Brief — Frontend v2.0
+   Features: dark mode, bookmarks, keyboard nav, trending, dynamic columns,
+   article search, reading list
    ========================================================================= */
 
 (() => {
@@ -30,7 +32,24 @@
 
   function tagClass(tag) { return `tag-${tag || "General"}`; }
 
-  // ── Header ──────────────────────────────────────────────────────────
+  // ── Dark Mode ────────���───────────────────────────────────────────────
+  const themeToggle = $("#themeToggle");
+  function applyTheme(dark) {
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+    localStorage.setItem("theme", dark ? "dark" : "light");
+  }
+  // Init from localStorage or system preference
+  const savedTheme = localStorage.getItem("theme");
+  const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const isDark = savedTheme ? savedTheme === "dark" : prefersDark;
+  applyTheme(isDark);
+
+  themeToggle.addEventListener("click", () => {
+    const current = document.documentElement.getAttribute("data-theme") === "dark";
+    applyTheme(!current);
+  });
+
+  // ── Header ──────��───────────────────────────────────────────────────
   (function initHeader() {
     const d = new Date();
     const el = $("#currentDate");
@@ -49,20 +68,172 @@
     if (el) el.textContent = new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: false });
   }
 
-  // ── Search ──────────────────────────────────────────────────────────
+  // ── Search (dual: article filter + Google) ───────────────────────────
+  const searchInput = $("#searchInput");
+  let searchMode = "filter"; // "filter" or "google"
+
   function doSearch() {
-    const q = $("#searchInput").value.trim();
-    if (!q) return;
-    window.open(`https://www.google.com/search?q=${encodeURIComponent(q)}`, "_blank");
+    const q = searchInput.value.trim();
+    if (!q) {
+      // Reset filters
+      applyNewsFilter("all");
+      applyAiFilter("all");
+      return;
+    }
+    // If starts with !, force Google search
+    if (q.startsWith("!")) {
+      window.open(`https://www.google.com/search?q=${encodeURIComponent(q.slice(1).trim())}`, "_blank");
+      return;
+    }
+    // Filter articles locally
+    filterAllByQuery(q);
   }
 
-  $("#searchInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); doSearch(); } });
+  function filterAllByQuery(q) {
+    const ql = q.toLowerCase();
+    const filteredNews = allTopNews.filter(i =>
+      i.title.toLowerCase().includes(ql) || (i.description || "").toLowerCase().includes(ql)
+    );
+    const filteredAi = allAiItems.filter(i =>
+      i.title.toLowerCase().includes(ql) || (i.description || "").toLowerCase().includes(ql)
+    );
+    renderNews($("#topNewsContainer"), filteredNews, filteredNews.length > 0);
+    renderAi($("#aiContainer"), filteredAi);
+    updateColCount("newsCount", filteredNews.length);
+    updateColCount("aiCount", filteredAi.length);
+  }
 
-  // ── News Rendering ──────────────────────────────────────────────────
+  searchInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); doSearch(); }
+    if (e.key === "Escape") {
+      searchInput.value = "";
+      searchInput.blur();
+      applyNewsFilter("all");
+      applyAiFilter("all");
+    }
+  });
+  searchInput.addEventListener("input", () => {
+    if (!searchInput.value.trim()) {
+      applyNewsFilter("all");
+      applyAiFilter("all");
+    }
+  });
+
+  // ── Bookmarks ──────��─────────────────────────────���───────────────────
+  let bookmarks = JSON.parse(localStorage.getItem("bookmarks") || "[]");
+
+  function saveBookmarks() {
+    localStorage.setItem("bookmarks", JSON.stringify(bookmarks));
+    updateBookmarkCount();
+  }
+
+  function updateBookmarkCount() {
+    const el = $("#bookmarkCount");
+    if (bookmarks.length > 0) {
+      el.style.display = "inline";
+      el.textContent = bookmarks.length;
+    } else {
+      el.style.display = "none";
+    }
+  }
+
+  function isBookmarked(url) {
+    return bookmarks.some(b => b.url === url);
+  }
+
+  function toggleBookmark(item) {
+    const idx = bookmarks.findIndex(b => b.url === item.link);
+    if (idx >= 0) {
+      bookmarks.splice(idx, 1);
+    } else {
+      bookmarks.push({
+        url: item.link,
+        title: item.title,
+        source: item.source,
+        tag: item.tag,
+        savedAt: new Date().toISOString(),
+      });
+    }
+    saveBookmarks();
+    renderBookmarks();
+  }
+
+  function renderBookmarks() {
+    const body = $("#bookmarksBody");
+    if (!bookmarks.length) {
+      body.innerHTML = `<div class="bookmarks-empty">No bookmarks yet. Press <kbd>s</kbd> on any article to save it.</div>`;
+      return;
+    }
+    body.innerHTML = bookmarks.map((b, i) => `
+      <div class="bookmark-item">
+        <a href="${b.url}" target="_blank" rel="noopener" class="bookmark-link">
+          <span class="news-tag ${tagClass(b.tag)}">${b.tag || "General"}</span>
+          <span class="bookmark-title">${b.title}</span>
+          <span class="bookmark-meta">${b.source} &middot; ${timeAgo(b.savedAt)}</span>
+        </a>
+        <button class="bookmark-remove" data-idx="${i}" title="Remove">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+    `).join("");
+  }
+
+  // Bookmarks panel toggle
+  const bookmarksPanel = $("#bookmarksPanel");
+  $("#bookmarksToggle").addEventListener("click", () => {
+    bookmarksPanel.classList.toggle("open");
+    if (bookmarksPanel.classList.contains("open")) renderBookmarks();
+  });
+  $("#bookmarksClose").addEventListener("click", () => bookmarksPanel.classList.remove("open"));
+  bookmarksPanel.addEventListener("click", (e) => {
+    const rm = e.target.closest(".bookmark-remove");
+    if (rm) {
+      const idx = parseInt(rm.dataset.idx);
+      bookmarks.splice(idx, 1);
+      saveBookmarks();
+      renderBookmarks();
+    }
+  });
+
+  updateBookmarkCount();
+
+  // ── Column count helper ──────────────────────────────────────────────
+  function updateColCount(id, count) {
+    const el = $(`#${id}`);
+    if (el) el.textContent = count > 0 ? `(${count})` : "";
+  }
+
+  // ── Dynamic Column Sizing ────────────────────────────────────────────
+  function adjustColumns(newsCount, footballCount, aiCount) {
+    const grid = $("#gridMain");
+    if (!grid) return;
+
+    const total = newsCount + footballCount + aiCount;
+    if (total === 0) return;
+
+    // Calculate proportional sizes based on article count, with min/max constraints
+    const newsRatio = Math.max(0.25, Math.min(0.45, newsCount / total));
+    const footballRatio = Math.max(0.2, Math.min(0.35, footballCount / total));
+    const aiRatio = Math.max(0.25, Math.min(0.45, aiCount / total));
+
+    // Normalize
+    const sum = newsRatio + footballRatio + aiRatio;
+    const nNews = newsRatio / sum;
+    const nFootball = footballRatio / sum;
+    const nAi = aiRatio / sum;
+
+    // Only adjust if we're on desktop (3-column layout)
+    if (window.innerWidth > 1200) {
+      grid.style.gridTemplateColumns = `${nNews}fr ${nFootball}fr ${nAi}fr`;
+    }
+  }
+
+  // ── News Rendering ───���──────────────────────────────────────────────
   let allTopNews = [];
 
   function heroCard(item) {
-    return `<a href="${item.link}" target="_blank" rel="noopener" class="news-hero">
+    const bm = isBookmarked(item.link) ? " bookmarked" : "";
+    return `<a href="${item.link}" target="_blank" rel="noopener" class="news-hero${bm}" data-url="${item.link}">
       <span class="hero-tag news-tag ${tagClass(item.tag)}">${item.tag}</span>
       <h3 class="hero-title">${item.title}</h3>
       <p class="hero-desc">${item.description || ""}</p>
@@ -77,7 +248,8 @@
     const thumb = item.thumbnail
       ? `<img class="news-row-thumb" src="${item.thumbnail}" alt="" loading="lazy" onerror="this.style.display='none'">`
       : "";
-    return `<a href="${item.link}" target="_blank" rel="noopener" class="news-row">
+    const bm = isBookmarked(item.link) ? " bookmarked" : "";
+    return `<a href="${item.link}" target="_blank" rel="noopener" class="news-row${bm}" data-url="${item.link}">
       ${thumb}
       <div class="news-row-body">
         <div class="news-row-head">
@@ -113,8 +285,10 @@
       if (cat === "top_news") {
         allTopNews = items;
         renderNews(c, items, true);
+        updateColCount("newsCount", items.length);
       } else if (cat === "football") {
         renderNews(c, items, false);
+        updateColCount("footballCount", items.length);
       }
       return items;
     } catch {
@@ -128,12 +302,14 @@
     let items = tag === "all" ? allTopNews : allTopNews.filter((i) => i.tag === tag);
     if (items.length < 3) items = allTopNews;
     renderNews($("#topNewsContainer"), items, true);
+    updateColCount("newsCount", items.length);
   }
 
   $$("#newsFilters .pill").forEach((btn) => {
     btn.addEventListener("click", () => {
       $$("#newsFilters .pill").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
+      searchInput.value = "";
       applyNewsFilter(btn.dataset.filter);
     });
   });
@@ -142,10 +318,13 @@
   let allAiItems = [];
 
   function aiCard(item) {
-    return `<a href="${item.link}" target="_blank" rel="noopener" class="ai-card">
+    const bm = isBookmarked(item.link) ? " bookmarked" : "";
+    const upvotes = item.upvotes ? `<span class="ai-upvotes" title="HuggingFace upvotes">${item.upvotes}</span>` : "";
+    return `<a href="${item.link}" target="_blank" rel="noopener" class="ai-card${bm}" data-url="${item.link}">
       <div class="ai-card-head">
         <span class="news-tag ${tagClass(item.tag)}">${item.tag}</span>
         <span class="ai-card-source">${item.source}</span>
+        ${upvotes}
       </div>
       <div class="ai-card-title">${item.title}</div>
       <div class="ai-card-desc">${item.description || ""}</div>
@@ -170,6 +349,7 @@
       if (!r.ok) throw new Error();
       allAiItems = await r.json();
       renderAi(c, allAiItems);
+      updateColCount("aiCount", allAiItems.length);
     } catch {
       c.innerHTML = `<div class="error-state">Failed to load. Try refreshing.</div>`;
     }
@@ -179,17 +359,19 @@
     let items = tag === "all" ? allAiItems : allAiItems.filter((i) => i.tag === tag);
     if (items.length < 2) items = allAiItems;
     renderAi($("#aiContainer"), items);
+    updateColCount("aiCount", items.length);
   }
 
   $$("#aiFilters .pill").forEach((btn) => {
     btn.addEventListener("click", () => {
       $$("#aiFilters .pill").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
+      searchInput.value = "";
       applyAiFilter(btn.dataset.filter);
     });
   });
 
-  // ── Ticker ──────────────────────────────────────────────────────────
+  // ── Ticker ───��──────────────────────────────────────────────────────
   function buildTicker(data) {
     const track = $("#tickerTrack");
     const all = [];
@@ -218,6 +400,32 @@
       return await r.json();
     } catch {
       return {};
+    }
+  }
+
+  // ── Trending Papers Banner ────────────────────────────────────────
+  async function fetchTrending() {
+    const track = $("#trendingTrack");
+    try {
+      const r = await fetch("/api/trending");
+      if (!r.ok) throw new Error();
+      const data = await r.json();
+      const papers = data.papers || [];
+      if (!papers.length) {
+        track.innerHTML = `<span class="trending-placeholder">No trending papers</span>`;
+        return;
+      }
+      const html = papers.slice(0, 20).map((p) => {
+        const upvotes = p.upvotes ? `<span class="trending-upvotes">${p.upvotes}</span>` : "";
+        return `<a href="${p.link}" target="_blank" rel="noopener" class="trending-card">
+          <span class="news-tag ${tagClass(p.tag)}">${p.tag || "ML"}</span>
+          <span class="trending-title">${p.title}</span>
+          ${upvotes}
+        </a>`;
+      }).join('<span class="trending-sep"></span>');
+      track.innerHTML = html + '<span class="trending-sep"></span>' + html;
+    } catch {
+      track.innerHTML = `<span class="trending-placeholder">Trending unavailable</span>`;
     }
   }
 
@@ -263,12 +471,17 @@
   const readerSource = $("#readerSource");
   const readerExtLink = $("#readerExtLink");
   const readerClose = $("#readerClose");
+  const readerBookmark = $("#readerBookmark");
+  let currentReaderItem = null;
 
-  function openReader(url, sourceName) {
+  function openReader(url, sourceName, item) {
+    currentReaderItem = item || { link: url, title: sourceName, source: sourceName, tag: "General" };
     readerOverlay.classList.add("open");
     document.body.style.overflow = "hidden";
     readerSource.textContent = sourceName || new URL(url).hostname;
     readerExtLink.href = url;
+    // Update bookmark button state
+    readerBookmark.classList.toggle("active", isBookmarked(url));
     readerBody.innerHTML = `<div class="reader-loading">
       <div class="skel skel-hero"></div>
       <div class="skel skel-row"></div>
@@ -279,7 +492,6 @@
       .then((r) => r.json())
       .then((data) => {
         if (data.error) {
-          // If site blocks server-side fetching, open directly in browser
           if (data.error === "blocked") {
             closeReader();
             window.open(data.source_url || url, "_blank", "noopener");
@@ -310,12 +522,10 @@
         metaParts.push(`<span>${new URL(url).hostname}</span>`);
         html += `<div class="reader-meta">${metaParts.join('<span style="color:var(--border-h)">|</span>')}</div>`;
 
-        // Decode HTML entities and convert text paragraphs to HTML
         const decoded = data.text.replace(/&#x27;/g, "'").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"');
         const paragraphs = decoded.split(/\n{2,}/).filter((p) => p.trim().length > 0);
         html += `<div class="reader-text">${paragraphs.map((p) => `<p>${p.trim()}</p>`).join("")}</div>`;
 
-        // Extra images (skip top_image)
         const extraImages = (data.images || []).filter((img) => img !== data.top_image).slice(0, 4);
         if (extraImages.length) {
           html += `<div class="reader-images">${extraImages.map((img) => `<img src="${img}" alt="" loading="lazy" onerror="this.style.display='none'">`).join("")}</div>`;
@@ -334,14 +544,19 @@
   function closeReader() {
     readerOverlay.classList.remove("open");
     document.body.style.overflow = "";
+    currentReaderItem = null;
   }
 
   readerClose.addEventListener("click", closeReader);
   readerOverlay.addEventListener("click", (e) => {
     if (e.target === readerOverlay) closeReader();
   });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && readerOverlay.classList.contains("open")) closeReader();
+
+  readerBookmark.addEventListener("click", () => {
+    if (currentReaderItem) {
+      toggleBookmark(currentReaderItem);
+      readerBookmark.classList.toggle("active", isBookmarked(currentReaderItem.link));
+    }
   });
 
   // Intercept news/article clicks to open in reader
@@ -353,10 +568,14 @@
     if (!url) return;
     const sourceEl = link.querySelector(".hero-source, .news-row-source, .ai-card-source");
     const sourceName = sourceEl ? sourceEl.textContent : "";
-    openReader(url, sourceName);
+
+    // Find the item data for bookmarking
+    const allItems = [...allTopNews, ...allAiItems];
+    const item = allItems.find(i => i.link === url) || { link: url, title: link.querySelector(".hero-title, .news-row-title, .ai-card-title")?.textContent || "", source: sourceName, tag: "General" };
+    openReader(url, sourceName, item);
   });
 
-  // ── Match Stats Modal ───────────────────────────────────────────────
+  // ── Match Stats Modal ───────���───────────────────────────────────────
   function openMatchStats(leagueCode, eventId) {
     readerOverlay.classList.add("open");
     document.body.style.overflow = "hidden";
@@ -400,7 +619,6 @@
           html += `</div>`;
         }
 
-        // Key events
         if (data.events.length) {
           html += `<div class="match-events">`;
           for (const ev of data.events) {
@@ -421,7 +639,6 @@
           html += `</div>`;
         }
 
-        // Stats comparison bars
         if (data.stats.length >= 2) {
           const hs = data.stats[0].stats;
           const as_ = data.stats[1].stats;
@@ -434,7 +651,6 @@
             const an = parseFloat(av) || 0;
             const total = hn + an || 1;
             const hPct = (hn / total) * 100;
-            // Possession special: values are already percentages
             const isPoss = key === "Possession";
             const hDisp = isPoss ? `${hv}%` : hv;
             const aDisp = isPoss ? `${av}%` : av;
@@ -469,26 +685,150 @@
     }
   });
 
-  // ── Boot ────────────────────────────────────────────────────────────
+  // ── Keyboard Navigation ─────────────────────────────────────────────
+  let focusedIdx = -1;
+  let kbdHintTimeout = null;
+
+  function getNavigableItems() {
+    return Array.from($$(".news-hero, .news-row, .ai-card"));
+  }
+
+  function clearFocus() {
+    $$(".kb-focus").forEach(el => el.classList.remove("kb-focus"));
+  }
+
+  function setFocus(idx) {
+    const items = getNavigableItems();
+    if (idx < 0 || idx >= items.length) return;
+    clearFocus();
+    focusedIdx = idx;
+    items[idx].classList.add("kb-focus");
+    items[idx].scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+
+  function showKbdHint() {
+    const hint = $("#kbdHint");
+    hint.classList.add("visible");
+    clearTimeout(kbdHintTimeout);
+    kbdHintTimeout = setTimeout(() => hint.classList.remove("visible"), 4000);
+  }
+
+  document.addEventListener("keydown", (e) => {
+    // Don't capture when typing in inputs
+    if (e.target.matches("input, textarea, select")) {
+      if (e.key === "Escape") e.target.blur();
+      return;
+    }
+
+    const readerOpen = readerOverlay.classList.contains("open");
+
+    switch (e.key) {
+      case "Escape":
+        if (readerOpen) closeReader();
+        else if (bookmarksPanel.classList.contains("open")) bookmarksPanel.classList.remove("open");
+        break;
+
+      case "j":
+        if (readerOpen) return;
+        e.preventDefault();
+        setFocus(Math.min(focusedIdx + 1, getNavigableItems().length - 1));
+        break;
+
+      case "k":
+        if (readerOpen) return;
+        e.preventDefault();
+        setFocus(Math.max(focusedIdx - 1, 0));
+        break;
+
+      case "o":
+      case "Enter":
+        if (readerOpen) return;
+        e.preventDefault();
+        const items = getNavigableItems();
+        if (focusedIdx >= 0 && focusedIdx < items.length) {
+          items[focusedIdx].click();
+        }
+        break;
+
+      case "s":
+        if (readerOpen && currentReaderItem) {
+          toggleBookmark(currentReaderItem);
+          readerBookmark.classList.toggle("active", isBookmarked(currentReaderItem.link));
+        } else if (!readerOpen) {
+          const navItems = getNavigableItems();
+          if (focusedIdx >= 0 && focusedIdx < navItems.length) {
+            const url = navItems[focusedIdx].getAttribute("href") || navItems[focusedIdx].dataset.url;
+            const allItems = [...allTopNews, ...allAiItems];
+            const item = allItems.find(i => i.link === url);
+            if (item) {
+              toggleBookmark(item);
+              navItems[focusedIdx].classList.toggle("bookmarked", isBookmarked(url));
+            }
+          }
+        }
+        break;
+
+      case "/":
+        if (readerOpen) return;
+        e.preventDefault();
+        searchInput.focus();
+        break;
+
+      case "b":
+        if (readerOpen) return;
+        bookmarksPanel.classList.toggle("open");
+        if (bookmarksPanel.classList.contains("open")) renderBookmarks();
+        break;
+
+      case "?":
+        if (readerOpen) return;
+        showKbdHint();
+        break;
+
+      case "r":
+        if (readerOpen) return;
+        loadAll();
+        break;
+    }
+  });
+
+  // ── Boot ──────��─────────────────────────────────────────────────────
   async function loadAll() {
     const btn = $("#refreshAll");
     btn.classList.add("spinning");
 
-    const [stockData] = await Promise.all([
+    const results = await Promise.all([
       fetchAllStocks(),
       fetchNews("top_news", "#topNewsContainer"),
       fetchNews("football", "#footballContainer"),
       fetchAi(),
       fetchScores(),
+      fetchTrending(),
     ]);
+
+    const stockData = results[0];
+    const topNewsItems = results[1];
+    const footballItems = results[2];
 
     buildTicker(stockData || {});
     stampUpdate();
     btn.classList.remove("spinning");
+
+    // Adjust column widths based on content volume
+    adjustColumns(
+      allTopNews.length,
+      footballItems ? footballItems.length : 0,
+      allAiItems.length
+    );
   }
 
   loadAll();
   $("#refreshAll").addEventListener("click", loadAll);
   setInterval(loadAll, 5 * 60 * 1000);
+
+  // Resize handler for dynamic columns
+  window.addEventListener("resize", () => {
+    adjustColumns(allTopNews.length, 0, allAiItems.length);
+  });
 
 })();

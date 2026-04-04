@@ -2,12 +2,13 @@
 """Daily Chore Dashboard - Personal news, stocks & search aggregator."""
 
 import json
+import math
 import os
 import re
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import feedparser
 import requests
@@ -47,11 +48,15 @@ RSS_FEEDS = {
         ("Google Transfer News", "https://news.google.com/rss/search?q=football+transfer+news+2026&hl=en-IN&gl=IN&ceid=IN:en"),
     ],
     "ai_research": [
-        # arXiv feeds — LLM, RL, retrieval, ranking, agents
+        # arXiv feeds — LLM, RL, retrieval, ranking, agents, vision, robotics
         ("arXiv CS.CL", "https://rss.arxiv.org/rss/cs.CL"),
         ("arXiv CS.AI", "https://rss.arxiv.org/rss/cs.AI"),
         ("arXiv CS.LG", "https://rss.arxiv.org/rss/cs.LG"),
         ("arXiv CS.IR", "https://rss.arxiv.org/rss/cs.IR"),
+        ("arXiv CS.CV", "https://rss.arxiv.org/rss/cs.CV"),
+        ("arXiv CS.RO", "https://rss.arxiv.org/rss/cs.RO"),
+        ("arXiv CS.MA", "https://rss.arxiv.org/rss/cs.MA"),
+        ("arXiv stat.ML", "https://rss.arxiv.org/rss/stat.ML"),
         # Frontier AI lab blogs
         ("OpenAI", "https://openai.com/blog/rss.xml"),
         ("Anthropic", "https://www.anthropic.com/rss/research.rss"),
@@ -60,10 +65,30 @@ RSS_FEEDS = {
         ("Mistral", "https://mistral.ai/blog-rss.xml"),
         ("Nvidia AI", "https://blogs.nvidia.com/feed/"),
         ("Microsoft Research", "https://www.microsoft.com/en-us/research/blog/feed/"),
-        # Expert blogs
+        ("Meta AI", "https://research.facebook.com/feed/"),
+        ("Apple ML", "https://machinelearning.apple.com/rss.xml"),
+        ("Amazon Science", "https://www.amazon.science/index.rss"),
+        ("Together AI", "https://www.together.ai/blog/rss.xml"),
+        # Google blogs
+        ("Google Developers", "https://developers.googleblog.com/feeds/posts/default?alt=rss"),
+        ("The Keyword Google", "https://blog.google/rss/"),
+        # Expert blogs & newsletters
         ("HuggingFace", "https://huggingface.co/blog/feed.xml"),
         ("The Gradient", "https://thegradient.pub/rss/"),
         ("Lil'Log", "https://lilianweng.github.io/index.xml"),
+        ("The Batch", "https://www.deeplearning.ai/the-batch/feed/"),
+        ("Import AI", "https://importai.substack.com/feed"),
+        ("Sebastian Raschka", "https://magazine.sebastianraschka.com/feed"),
+        ("Simon Willison", "https://simonwillison.net/atom/everything/"),
+        ("Chip Huyen", "https://huyenchip.com/feed.xml"),
+        ("Jay Alammar", "https://jalammar.github.io/feed.xml"),
+        # Community / social signal feeds
+        ("r/MachineLearning", "https://www.reddit.com/r/MachineLearning/.rss"),
+        ("r/LocalLLaMA", "https://www.reddit.com/r/LocalLLaMA/.rss"),
+        ("HN AI", "https://hnrss.org/newest?q=LLM+OR+GPT+OR+transformer+OR+%22machine+learning%22"),
+        # Conference blogs
+        ("NeurIPS Blog", "https://blog.neurips.cc/feed/"),
+        ("AAAI", "https://aaai.org/feed/"),
         # Aggregated AI news
         ("Google AI News", "https://news.google.com/rss/search?q=LLM+OR+large+language+model+OR+reinforcement+learning+OR+AI+agents+OR+RAG+retrieval&hl=en-US&gl=US&ceid=US:en"),
     ],
@@ -360,13 +385,25 @@ AI_HIGH_IMPACT_KEYWORDS = {
 AI_SOURCE_TIERS = {
     # Tier 1: frontier labs — primary source of groundbreaking work
     "OpenAI": 8.0, "Anthropic": 8.0, "DeepMind": 8.0,
-    "Google AI": 7.0, "Mistral": 6.0, "Nvidia AI": 6.0, "Microsoft Research": 6.0,
-    # Tier 2: high-quality expert blogs
+    "Google AI": 7.0, "Meta AI": 7.0, "Mistral": 6.0, "Nvidia AI": 6.0,
+    "Microsoft Research": 6.0, "Apple ML": 6.5, "Amazon Science": 5.5,
+    "Together AI": 4.5,
+    # Tier 2: high-quality expert blogs & newsletters
     "Lil'Log": 6.0, "The Gradient": 5.0, "HuggingFace": 5.0,
+    "The Batch": 5.0, "Import AI": 5.0, "Sebastian Raschka": 5.0,
+    "Simon Willison": 4.5, "Chip Huyen": 5.0, "Jay Alammar": 4.5,
+    # Tier 2b: Google blogs
+    "Google Developers": 3.5, "The Keyword Google": 3.0,
+    # Tier 2c: conference blogs
+    "NeurIPS Blog": 6.0, "AAAI": 5.0,
     # Tier 3: arXiv (high volume, variable quality)
     "arXiv CS.CL": 2.0, "arXiv CS.AI": 2.0, "arXiv CS.LG": 2.0, "arXiv CS.IR": 1.5,
-    # Tier 4: aggregated/curated news
+    "arXiv CS.CV": 2.0, "arXiv CS.RO": 1.5, "arXiv CS.MA": 1.5, "arXiv stat.ML": 1.5,
+    # Tier 4: community / aggregated (social signal, not editorial)
+    "r/MachineLearning": 2.5, "r/LocalLLaMA": 2.0, "HN AI": 2.5,
     "Google AI News": 1.5,
+    # Tier 0: HuggingFace Daily Papers (curated trending — very high signal)
+    "HF Daily Papers": 7.0,
 }
 
 # SOTA / breakthrough detection — something genuinely novel happened
@@ -557,9 +594,8 @@ def _score_article(item: dict) -> float:
     if any(lf in text for lf in local_foreign) and "india" not in text:
         importance -= 25.0
 
-    # Recency: no time-based priority for top stories — importance alone determines rank.
-    # Exception: confirmed breaking news (matched BREAKING_SIGNALS above) gets a recency
-    # boost so genuinely unfolding emergencies surface quickly.
+    # Recency: exponential decay with configurable half-life.
+    # Breaking news decays with ~3hr half-life; non-breaking uses importance only.
     is_breaking = any(kw in title for kw in BREAKING_SIGNALS)
     age_h = None
     if pub:
@@ -571,16 +607,10 @@ def _score_article(item: dict) -> float:
     if is_breaking:
         if age_h is None:
             recency_mult = 0.7
-        elif age_h < 1:
-            recency_mult = 2.5
-        elif age_h < 3:
-            recency_mult = 2.0
-        elif age_h < 6:
-            recency_mult = 1.6
-        elif age_h < 12:
-            recency_mult = 1.3
         else:
-            recency_mult = 1.0
+            # Exponential decay: half-life ~3 hours, max 2.5x for very fresh
+            recency_mult = 2.5 * math.exp(-0.23 * max(age_h, 0))
+            recency_mult = max(recency_mult, 0.5)
     else:
         recency_mult = 1.0  # flat — rank by importance only
 
@@ -635,8 +665,8 @@ def _score_football_article(item: dict) -> float:
     if _SOFT_NEWS_RE.search(title):
         importance -= 20.0
 
-    # Recency multiplier — kept deliberately low to prevent fresh previews
-    # from outranking important older results. Max 1.3 (was 2.2).
+    # Recency: exponential decay with ~18hr half-life. Kept deliberately gentle
+    # so important older results beat trivial fresh previews. Max 1.3.
     age_h = None
     if pub:
         try:
@@ -645,16 +675,9 @@ def _score_football_article(item: dict) -> float:
             pass
     if age_h is None:
         recency_mult = 0.5
-    elif age_h < 6:
-        recency_mult = 1.3
-    elif age_h < 24:
-        recency_mult = 1.1
-    elif age_h < 48:
-        recency_mult = 0.9
-    elif age_h < 72:
-        recency_mult = 0.6
     else:
-        recency_mult = 0.2
+        recency_mult = 1.3 * math.exp(-0.039 * max(age_h, 0))  # half-life ~18h
+        recency_mult = max(recency_mult, 0.1)
 
     source_boost = SOURCE_AUTHORITY.get(item.get("source", ""), 1.5)
     return max(importance, 0.0) * recency_mult + source_boost
@@ -712,7 +735,7 @@ def _score_ai_article(item: dict) -> float:
     if _SOFT_NEWS_RE.search(title):
         importance -= 10.0
 
-    # Recency multiplier — 3-month window (2160 hr).
+    # Recency: exponential decay with ~48hr half-life.
     # Max 2.0 so a breakthrough from last week still beats fresh trivia.
     age_h = None
     if pub:
@@ -722,18 +745,9 @@ def _score_ai_article(item: dict) -> float:
             pass
     if age_h is None:
         recency_mult = 0.5
-    elif age_h < 24:
-        recency_mult = 2.0
-    elif age_h < 72:       # up to 3 days
-        recency_mult = 1.5
-    elif age_h < 168:      # up to 1 week
-        recency_mult = 1.2
-    elif age_h < 720:      # up to 1 month
-        recency_mult = 0.9
-    elif age_h < 2160:     # up to 3 months
-        recency_mult = 0.6
     else:
-        recency_mult = 0.2
+        recency_mult = 2.0 * math.exp(-0.0145 * max(age_h, 0))  # half-life ~48h
+        recency_mult = max(recency_mult, 0.1)
 
     source_boost = AI_SOURCE_TIERS.get(item.get("source", ""), 1.5)
     return max(importance, 0.0) * recency_mult + source_boost
@@ -867,11 +881,23 @@ def _fetch_all_feeds(category: str) -> list[dict]:
     feeds = RSS_FEEDS.get(category, [])
     all_items: list[dict] = []
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=12) as pool:
         futures = {pool.submit(_fetch_feed, name, url): name for name, url in feeds}
+        # For AI research, also pull in HuggingFace Daily Papers as a high-signal source
+        hf_future = None
+        if category == "ai_research":
+            hf_future = pool.submit(_fetch_hf_daily_papers)
         for future in as_completed(futures):
             try:
                 all_items.extend(future.result())
+            except Exception:
+                pass
+        if hf_future:
+            try:
+                hf_papers = hf_future.result()
+                for p in hf_papers:
+                    p["source"] = "HF Daily Papers"
+                all_items.extend(hf_papers)
             except Exception:
                 pass
 
@@ -1123,7 +1149,7 @@ def _fetch_all_scores() -> list[dict]:
         return cached
 
     now = datetime.now(timezone.utc)
-    start = now - __import__("datetime").timedelta(days=7)
+    start = now - timedelta(days=7)
     date_range = f"{start.strftime('%Y%m%d')}-{now.strftime('%Y%m%d')}"
 
     all_matches: list[dict] = []
@@ -1171,6 +1197,109 @@ def _fetch_all_scores() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Trending Papers — HuggingFace Daily Papers + community signals
+# ---------------------------------------------------------------------------
+
+def _fetch_hf_daily_papers() -> list[dict]:
+    """Fetch trending papers from HuggingFace Daily Papers API."""
+    try:
+        resp = requests.get("https://huggingface.co/api/daily_papers", headers=HEADERS, timeout=12)
+        if resp.status_code != 200:
+            return []
+        papers = resp.json()
+        items = []
+        for p in papers[:30]:
+            paper = p.get("paper", {})
+            title = paper.get("title", "")
+            abstract = paper.get("summary", "")
+            arxiv_id = paper.get("id", "")
+            pub_date = paper.get("publishedAt", "")
+            upvotes = p.get("numUpvotes", 0)
+            if not title:
+                continue
+            items.append({
+                "title": title,
+                "link": f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else "",
+                "source": "HF Daily Papers",
+                "published": pub_date,
+                "description": (abstract[:220] + "...") if len(abstract) > 220 else abstract,
+                "thumbnail": "",
+                "upvotes": upvotes,
+                "paper_id": arxiv_id,
+            })
+        return items
+    except Exception:
+        return []
+
+
+def _fetch_hf_trending_models() -> list[dict]:
+    """Fetch popular models from HuggingFace API."""
+    try:
+        resp = requests.get(
+            "https://huggingface.co/api/models",
+            params={"sort": "likes", "direction": "-1", "limit": "15"},
+            headers=HEADERS, timeout=10,
+        )
+        if resp.status_code != 200:
+            return []
+        models = resp.json()
+        items = []
+        for m in models:
+            model_id = m.get("modelId", "") or m.get("id", "")
+            tags = m.get("tags", [])
+            pipeline = m.get("pipeline_tag", "")
+            likes = m.get("likes", 0)
+            downloads = m.get("downloads", 0)
+            items.append({
+                "model_id": model_id,
+                "pipeline": pipeline,
+                "tags": tags[:5],
+                "likes": likes,
+                "downloads": downloads,
+                "link": f"https://huggingface.co/{model_id}",
+            })
+        return items
+    except Exception:
+        return []
+
+
+def _fetch_trending() -> dict:
+    """Fetch all trending data: daily papers + trending models."""
+    cached = _cached("trending_data", ttl=600)
+    if cached is not None:
+        return cached
+
+    papers = []
+    models = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fp = pool.submit(_fetch_hf_daily_papers)
+        fm = pool.submit(_fetch_hf_trending_models)
+        try:
+            papers = fp.result()
+        except Exception:
+            pass
+        try:
+            models = fm.result()
+        except Exception:
+            pass
+
+    # Score and tag the daily papers using the AI scoring pipeline
+    for item in papers:
+        item["tag"] = _tag_ai_article(item)
+        item["score"] = _score_ai_article(item)
+        # Boost by community upvotes (log scale to prevent runaway)
+        upvotes = item.get("upvotes", 0)
+        if upvotes > 0:
+            item["score"] += min(math.log2(upvotes + 1) * 2.0, 10.0)
+
+    papers.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    result = {"papers": papers, "models": models}
+    _set_cache("trending_data", result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -1205,6 +1334,12 @@ def api_stocks_all():
 @app.route("/api/scores")
 def api_scores():
     return jsonify(_fetch_all_scores())
+
+
+@app.route("/api/trending")
+def api_trending():
+    """Return trending papers and models from HuggingFace."""
+    return jsonify(_fetch_trending())
 
 
 @app.route("/api/match/<league>/<event_id>")
