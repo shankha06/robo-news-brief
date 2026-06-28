@@ -1240,6 +1240,11 @@ FOOTBALL_LEAGUES = [
     ("uefa.europa.conf", "Conference League", "UECL"),
     ("fifa.friendly", "International", "INTL"),
     ("uefa.nations", "Nations League", "UNL"),
+    ("fifa.world", "FIFA World Cup", "WC"),
+    ("uefa.euro", "UEFA European Championship", "EURO"),
+    ("conmebol.america", "Copa América", "COPA"),
+    ("caf.nations", "Africa Cup of Nations", "AFCON"),
+    ("concacaf.gold", "Concacaf Gold Cup", "GOLD"),
 ]
 
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
@@ -1261,6 +1266,11 @@ TOP_TEAMS = {
              "portugal", "india", "italy", "netherlands", "belgium"},
     "UNL": {"brazil", "argentina", "france", "england", "germany", "spain",
             "portugal", "india", "italy", "netherlands", "belgium"},
+    "WC": None,
+    "EURO": None,
+    "COPA": None,
+    "AFCON": None,
+    "GOLD": None,
 }
 
 
@@ -1304,46 +1314,66 @@ async def _fetch_league_scores(league_code: str, league_name: str, short: str,
 
 
 async def _fetch_all_scores() -> list[dict]:
-    cached = _cached("football_scores", ttl=1800)
-    if cached is not None:
-        return cached
+    cached = _cache.get("football_scores")
+    if cached:
+        age = time.time() - cached["ts"]
+        # Use 30m TTL for real data, 5m TTL for empty data (off-season/API down)
+        effective_ttl = 1800 if cached["data"] else 300
+        if age < effective_ttl:
+            return cached["data"]
 
-    now   = datetime.now(timezone.utc)
-    start = now - timedelta(days=7)
-    date_range = f"{start.strftime('%Y%m%d')}-{now.strftime('%Y%m%d')}"
-
-    tasks = [
-        asyncio.create_task(_fetch_league_scores(code, name, short, date_range))
-        for code, name, short in FOOTBALL_LEAGUES
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    all_matches: list[dict] = []
-    club_match_count = 0
-    for (code, name, short), r in zip(FOOTBALL_LEAGUES, results):
-        if isinstance(r, list):
-            is_intl = short in ("INTL", "UNL")
-            if not is_intl:
-                club_match_count += len(r)
-            all_matches.extend(r)
-
-    if club_match_count >= 8:
-        all_matches = [m for m in all_matches if m["league_short"] not in ("INTL", "UNL")]
-
+    now = datetime.now(timezone.utc)
     filtered = []
-    for m in all_matches:
-        top = TOP_TEAMS.get(m["league_short"])
-        if top is None:
-            filtered.append(m)
-            continue
-        home_lc = m["home"].lower()
-        away_lc = m["away"].lower()
-        if any(t in home_lc or home_lc in t for t in top) or \
-           any(t in away_lc or away_lc in t for t in top):
-            filtered.append(m)
+
+    # During off-season, dynamically search wider ranges to display recent matches
+    for days in (7, 30, 45, 60):
+        start = now - timedelta(days=days)
+        date_range = f"{start.strftime('%Y%m%d')}-{now.strftime('%Y%m%d')}"
+
+        tasks = [
+            asyncio.create_task(_fetch_league_scores(code, name, short, date_range))
+            for code, name, short in FOOTBALL_LEAGUES
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_matches: list[dict] = []
+        club_match_count = 0
+        for (code, name, short), r in zip(FOOTBALL_LEAGUES, results):
+            if isinstance(r, list):
+                is_intl = short in ("INTL", "UNL")
+                if not is_intl:
+                    club_match_count += len(r)
+                all_matches.extend(r)
+
+        if club_match_count >= 8:
+            all_matches = [m for m in all_matches if m["league_short"] not in ("INTL", "UNL")]
+
+        for m in all_matches:
+            top = TOP_TEAMS.get(m["league_short"])
+            if top is None:
+                filtered.append(m)
+                continue
+            home_lc = m["home"].lower()
+            away_lc = m["away"].lower()
+            if any(t in home_lc or home_lc in t for t in top) or \
+               any(t in away_lc or away_lc in t for t in top):
+                filtered.append(m)
+
+        if filtered:
+            break
 
     filtered.sort(key=lambda x: x.get("date", ""), reverse=True)
+    # If we couldn't find any matches at all (API failed or extremely long break),
+    # cache the empty list with a much shorter TTL of 5 minutes so we retry sooner.
+    ttl = 1800 if filtered else 300
     _set_cache("football_scores", filtered)
+    
+    # We need to temporarily override the cached value TTL if empty since _cached uses CACHE_TTL by default
+    # But since _cached takes a ttl parameter, _cached("football_scores", ttl=1800 if ... else 300) is clean
+    if not filtered:
+        # Save custom entry with lower TS/TTL or just let it cache with standard entry but read it with dynamic TTL
+        pass
+        
     return filtered
 
 
@@ -1408,9 +1438,14 @@ async def _fetch_hf_trending_models() -> list[dict]:
 
 
 async def _fetch_trending() -> dict:
-    cached = _cached("trending_data", ttl=3600)
-    if cached is not None:
-        return cached
+    cached = _cache.get("trending_data")
+    if cached:
+        age = time.time() - cached["ts"]
+        # Use 1h TTL for real data, 30s TTL for empty/failed data
+        has_data = bool(cached["data"].get("papers") or cached["data"].get("models"))
+        effective_ttl = 3600 if has_data else 30
+        if age < effective_ttl:
+            return cached["data"]
 
     papers, models = await asyncio.gather(
         _fetch_hf_daily_papers(),
@@ -1760,9 +1795,19 @@ async def api_match(league: str, event_id: str):
 
     gi    = sdata.get("gameInfo", {})
     venue = gi.get("venue", {})
+    address = venue.get("address", {})
+    city = address.get("city", "")
+    country = address.get("country", "")
+    location = ""
+    if city and country:
+        location = f"{city}, {country}"
+    elif city or country:
+        location = city or country
+
     result = {
         "teams": teams, "stats": team_stats, "events": key_events,
-        "venue": venue.get("fullName", ""), "attendance": gi.get("attendance", ""),
+        "venue": venue.get("fullName", ""), "location": location,
+        "attendance": gi.get("attendance", ""), "date": comps.get("date", ""),
     }
     _set_cache(cache_key, result)
     return JSONResponse(result)

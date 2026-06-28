@@ -912,6 +912,11 @@ a { color: inherit; text-decoration: none; }
 .league-UECL  { background: #01a84e; }
 .league-INTL  { background: #555; }
 .league-UNL   { background: #01136c; }
+.league-WC    { background: #1b4f72; }
+.league-EURO  { background: #1a5276; }
+.league-COPA  { background: #196f3d; }
+.league-AFCON { background: #b7950b; }
+.league-GOLD  { background: #935116; }
 
 .score-teams {
   display: flex;

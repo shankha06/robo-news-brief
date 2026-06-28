@@ -582,11 +582,21 @@
           </div>
         </div>`;
 
-        if (data.venue || data.attendance) {
-          html += `<div class="match-venue">`;
-          if (data.venue) html += `<span>${data.venue}</span>`;
-          if (data.attendance) html += `<span>Attendance: ${Number(data.attendance).toLocaleString()}</span>`;
-          html += `</div>`;
+        let infoParts = [];
+        if (data.date) {
+          const d = new Date(data.date);
+          const dateStr = d.toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "short", year: "numeric" });
+          const timeStr = d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: false });
+          infoParts.push(`<span>${dateStr} &middot; ${timeStr}</span>`);
+        }
+        let venueParts = [];
+        if (data.venue) venueParts.push(data.venue);
+        if (data.location) venueParts.push(data.location);
+        if (venueParts.length) infoParts.push(`<span>${venueParts.join(", ")}</span>`);
+        if (data.attendance) infoParts.push(`<span>Attendance: ${Number(data.attendance).toLocaleString()}</span>`);
+
+        if (infoParts.length) {
+          html += `<div class="match-venue" style="flex-direction:column; gap:4px">${infoParts.join("")}</div>`;
         }
 
         if (data.events.length) {
