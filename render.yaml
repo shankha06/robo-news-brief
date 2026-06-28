@@ -3,6 +3,3 @@ services:
     name: the-brief
     runtime: docker
     plan: free
-    envVars:
-      - key: FLASK_DEBUG
-        value: "0"

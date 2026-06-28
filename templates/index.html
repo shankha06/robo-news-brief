@@ -15,6 +15,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Newsreader:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="manifest" href="/manifest.json">
 </head>
 <body>
 
@@ -52,9 +53,9 @@
 
   <!-- Search -->
   <section class="search-section">
-    <form class="search-box" id="searchForm" onsubmit="return false;">
+    <form class="search-box" id="searchForm" method="get" action="https://www.google.com/search" target="_blank">
       <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-      <input type="text" id="searchInput" class="search-input" placeholder="Search articles or Google..." autocomplete="off" spellcheck="false">
+      <input type="text" id="searchInput" name="q" class="search-input" placeholder="Type to filter · Enter to search Google..." autocomplete="off" spellcheck="false">
       <kbd class="search-kbd">/</kbd>
     </form>
   </section>
@@ -216,5 +217,10 @@
   </footer>
 
   <script src="/static/js/app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
+    }
+  </script>
 </body>
 </html>

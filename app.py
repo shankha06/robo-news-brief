@@ -1,23 +1,81 @@
 #!/usr/bin/env python3
-"""Daily Chore Dashboard - Personal news, stocks & search aggregator."""
+"""The Brief — Personal news, stocks & search aggregator (FastAPI edition)."""
 
+import asyncio
+import ipaddress
 import json
 import math
 import os
 import re
+import socket
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib.parse
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-import feedparser
-import requests
-import yfinance as yf
-from flask import Flask, jsonify, render_template, request
-from newspaper import Article
-from googlenewsdecoder import new_decoderv1
+# Use OS trust store (macOS Keychain / Linux ca-certificates) so corporate SSL
+# proxy certificates are trusted without disabling verification entirely.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    pass  # falls back to certifi — fine on Render/standard Linux
 
-app = Flask(__name__)
+import feedparser
+import httpx
+import trafilatura
+from fastapi import FastAPI, Query, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+try:
+    from googlenewsdecoder import new_decoderv1 as _gnd_decoder
+except ImportError:
+    _gnd_decoder = None
+
+_PILImage = None   # lazy-loaded on first image proxy request
+_io_mod    = None
+_PIL_AVAILABLE = None  # None = not yet checked; True/False after first attempt
+
+def _ensure_pil() -> bool:
+    global _PILImage, _io_mod, _PIL_AVAILABLE
+    if _PIL_AVAILABLE is not None:
+        return _PIL_AVAILABLE
+    try:
+        from PIL import Image as _img
+        import io as _io
+        _PILImage = _img
+        _io_mod   = _io
+        _PIL_AVAILABLE = True
+    except ImportError:
+        _PIL_AVAILABLE = False
+    return _PIL_AVAILABLE
+
+# ---------------------------------------------------------------------------
+# HTTP client (lifecycle managed by lifespan)
+# ---------------------------------------------------------------------------
+
+_http_client: httpx.AsyncClient | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _http_client
+    _http_client = httpx.AsyncClient(
+        headers=HEADERS,
+        timeout=httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=5.0),
+        limits=httpx.Limits(max_connections=60, max_keepalive_connections=20),
+        follow_redirects=True,
+    )
+    yield
+    await _http_client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -25,18 +83,16 @@ app = Flask(__name__)
 
 RSS_FEEDS = {
     "top_news": [
-        # India national news
         ("NDTV", "https://feeds.feedburner.com/ndtvnews-top-stories"),
         ("Times of India", "https://timesofindia.indiatimes.com/rssfeedstopstories.cms"),
         ("Economic Times", "https://economictimes.indiatimes.com/rssfeedstopstories.cms"),
         ("Livemint", "https://www.livemint.com/rss/news"),
         ("Moneycontrol", "https://www.moneycontrol.com/rss/latestnews.xml"),
-        # High-quality global news
         ("BBC News", "https://feeds.bbci.co.uk/news/rss.xml"),
         ("BBC Business", "https://feeds.bbci.co.uk/news/business/rss.xml"),
+        ("The Guardian", "https://www.theguardian.com/world/rss"),
         ("Google News", "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en"),
         ("Google News India", "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en"),
-        # Tech & Jobs
         ("TechCrunch", "https://techcrunch.com/feed/"),
         ("Google Tech", "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGRqTVhZU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en"),
         ("Google Jobs/Layoffs", "https://news.google.com/rss/search?q=job+cuts+OR+layoffs+OR+WFH+OR+remote+work&hl=en-US&gl=US&ceid=US:en"),
@@ -48,7 +104,6 @@ RSS_FEEDS = {
         ("Google Transfer News", "https://news.google.com/rss/search?q=football+transfer+news+2026&hl=en-IN&gl=IN&ceid=IN:en"),
     ],
     "ai_research": [
-        # arXiv feeds — LLM, RL, retrieval, ranking, agents, vision, robotics
         ("arXiv CS.CL", "https://rss.arxiv.org/rss/cs.CL"),
         ("arXiv CS.AI", "https://rss.arxiv.org/rss/cs.AI"),
         ("arXiv CS.LG", "https://rss.arxiv.org/rss/cs.LG"),
@@ -57,7 +112,6 @@ RSS_FEEDS = {
         ("arXiv CS.RO", "https://rss.arxiv.org/rss/cs.RO"),
         ("arXiv CS.MA", "https://rss.arxiv.org/rss/cs.MA"),
         ("arXiv stat.ML", "https://rss.arxiv.org/rss/stat.ML"),
-        # Frontier AI lab blogs
         ("OpenAI", "https://openai.com/blog/rss.xml"),
         ("Anthropic", "https://www.anthropic.com/rss/research.rss"),
         ("Google AI", "https://blog.research.google/feeds/posts/default?alt=rss"),
@@ -69,10 +123,8 @@ RSS_FEEDS = {
         ("Apple ML", "https://machinelearning.apple.com/rss.xml"),
         ("Amazon Science", "https://www.amazon.science/index.rss"),
         ("Together AI", "https://www.together.ai/blog/rss.xml"),
-        # Google blogs
         ("Google Developers", "https://developers.googleblog.com/feeds/posts/default?alt=rss"),
         ("The Keyword Google", "https://blog.google/rss/"),
-        # Expert blogs & newsletters
         ("HuggingFace", "https://huggingface.co/blog/feed.xml"),
         ("The Gradient", "https://thegradient.pub/rss/"),
         ("Lil'Log", "https://lilianweng.github.io/index.xml"),
@@ -82,19 +134,15 @@ RSS_FEEDS = {
         ("Simon Willison", "https://simonwillison.net/atom/everything/"),
         ("Chip Huyen", "https://huyenchip.com/feed.xml"),
         ("Jay Alammar", "https://jalammar.github.io/feed.xml"),
-        # Community / social signal feeds
         ("r/MachineLearning", "https://www.reddit.com/r/MachineLearning/.rss"),
         ("r/LocalLLaMA", "https://www.reddit.com/r/LocalLLaMA/.rss"),
         ("HN AI", "https://hnrss.org/newest?q=LLM+OR+GPT+OR+transformer+OR+%22machine+learning%22"),
-        # Conference blogs
         ("NeurIPS Blog", "https://blog.neurips.cc/feed/"),
         ("AAAI", "https://aaai.org/feed/"),
-        # Aggregated AI news
         ("Google AI News", "https://news.google.com/rss/search?q=LLM+OR+large+language+model+OR+reinforcement+learning+OR+AI+agents+OR+RAG+retrieval&hl=en-US&gl=US&ceid=US:en"),
     ],
 }
 
-# Prioritised tickers: key indices + commodities only
 STOCK_SYMBOLS = {
     "india": [
         ("NIFTY 50", "^NSEI"),
@@ -109,7 +157,7 @@ STOCK_SYMBOLS = {
     ],
     "commodities": [
         ("GOLD", "GC=F"),
-        ("CRUDE OIL", "CL=F"),
+        ("BRENT CRUDE", "BZ=F"),
         ("USD/INR", "INR=X"),
     ],
 }
@@ -120,15 +168,15 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
     "Accept-Encoding": "gzip, deflate, br",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
 }
 
+CACHE_TTL = 900  # seconds (15 min — feeds: top_news, football, ai_research, stocks)
+
+# ---------------------------------------------------------------------------
 # Simple in-memory cache
+# ---------------------------------------------------------------------------
+
 _cache: dict = {}
-CACHE_TTL = 300  # 5 minutes
 
 
 def _cached(key: str, ttl: int = CACHE_TTL):
@@ -138,72 +186,89 @@ def _cached(key: str, ttl: int = CACHE_TTL):
     return None
 
 
-def _set_cache(key: str, data):
+def _set_cache(key: str, data) -> None:
     _cache[key] = {"data": data, "ts": time.time()}
 
 
 # ---------------------------------------------------------------------------
-# News relevance scoring
+# Circuit breaker (per feed URL)
 # ---------------------------------------------------------------------------
 
-# Weighted keyword dict — specific/rare keywords score higher than broad ones.
-# Low weights (0.5) prevent common words like "ai", "startup" from inflating scores.
+class CircuitBreaker:
+    """3 failures → open for 120s, then half-open."""
+
+    _threshold = 3
+    _recovery = 120.0
+
+    def __init__(self):
+        self._failures: dict[str, int] = {}
+        self._opened_at: dict[str, float] = {}
+
+    def is_open(self, key: str) -> bool:
+        if self._failures.get(key, 0) < self._threshold:
+            return False
+        elapsed = time.monotonic() - self._opened_at.get(key, 0)
+        if elapsed < self._recovery:
+            return True
+        # Half-open: reset to threshold-1 so one more failure re-opens
+        self._failures[key] = self._threshold - 1
+        return False
+
+    def record_failure(self, key: str) -> None:
+        self._failures[key] = self._failures.get(key, 0) + 1
+        if self._failures[key] >= self._threshold:
+            self._opened_at[key] = time.monotonic()
+
+    def record_success(self, key: str) -> None:
+        self._failures.pop(key, None)
+        self._opened_at.pop(key, None)
+
+
+_cb = CircuitBreaker()
+
+# Per-feed HTTP conditional-request cache: url → {etag, last_modified}
+_feed_http_cache: dict[str, dict] = {}
+# Per-feed stale items (served on 304 or circuit-open)
+_feed_items_cache: dict[str, list] = {}
+
+# ---------------------------------------------------------------------------
+# Scoring constants (unchanged from v1)
+# ---------------------------------------------------------------------------
+
 HIGH_PRIORITY_KEYWORDS = {
-    # India-critical (city names low weight — appear in every India story)
     "india": 1.5, "modi": 3.0, "rbi": 3.0, "sensex": 1.5, "nifty": 1.5,
     "rupee": 1.5, "parliament": 2.5, "lok sabha": 3.0, "rajya sabha": 3.0,
     "supreme court": 2.5, "delhi": 1.0, "mumbai": 1.0, "bengaluru": 1.0,
     "bangalore": 1.0, "hyderabad": 0.5, "chennai": 0.5, "kolkata": 0.5,
     "pune": 0.5, "budget": 2.5, "gdp": 2.0, "inflation": 2.0,
     "isro": 2.0, "upi": 1.5, "aadhaar": 1.0, "gst": 1.5,
-    # Finance
     "market crash": 4.5, "rally": 1.0, "interest rate": 2.5, "fed": 2.0,
     "recession": 4.0, "ipo": 2.0, "stock market": 1.5, "bull": 0.5,
     "bear": 0.5, "sebi": 2.0,
-    # Tech & Jobs (broad terms deliberately low to prevent inflation)
     "layoff": 3.0, "job cut": 3.5, "hiring freeze": 3.5, "wfh": 0.5,
     "remote work": 0.5, "ai": 0.5, "startup": 0.5, "unicorn": 1.5,
     "funding": 0.5,
-    # Geopolitics
     "tariff": 2.0, "trade war": 4.0, "china": 1.5, "pakistan": 2.0,
     "us-india": 3.0, "sanctions": 3.0, "opec": 2.5, "oil price": 2.0,
     "climate": 1.0, "g20": 2.0, "brics": 1.5,
-    # Big impact (rare = high weight)
     "breaking": 4.0, "exclusive": 1.5, "major": 0.5, "crisis": 4.0,
     "emergency": 4.5, "war": 4.0, "election": 2.5, "resignation": 3.5,
     "arrested": 2.5,
 }
 
-# Source authority — credible editorial outlets rank higher than aggregator feeds
 SOURCE_AUTHORITY = {
-    # Tier 1: editorial oversight, fact-checking, journalistic standards
-    "BBC News": 6.0,
-    "BBC Business": 6.0,
-    "BBC Football": 6.0,
+    "BBC News": 6.0, "BBC Business": 6.0, "BBC Football": 6.0,
+    "The Guardian": 6.0,
     "ESPN Soccer": 5.0,
-    "Times of India": 5.0,
-    "NDTV": 5.0,
-    "Economic Times": 5.0,
-    "Livemint": 4.5,
-    "Moneycontrol": 4.0,
-    "TechCrunch": 4.5,
-    # Tier 2: aggregator feeds (content varies in quality)
-    "Google News": 2.0,
-    "Google News India": 2.0,
-    # Tier 3: narrow-topic Google feeds (lowest editorial control)
-    "Google Tech": 1.5,
-    "Google Football": 1.5,
-    "Google Transfer News": 1.0,
-    "Google Jobs/Layoffs": 1.0,
-    "Google AI News": 1.5,
-    # AI lab / research blogs
-    "DeepMind": 6.0,
-    "Mistral": 5.0,
-    "Nvidia AI": 5.0,
+    "Times of India": 5.0, "NDTV": 5.0, "Economic Times": 5.0,
+    "Livemint": 4.5, "Moneycontrol": 4.0, "TechCrunch": 4.5,
+    "Google News": 2.0, "Google News India": 2.0,
+    "Google Tech": 1.5, "Google Football": 1.5,
+    "Google Transfer News": 1.0, "Google Jobs/Layoffs": 1.0, "Google AI News": 1.5,
+    "DeepMind": 6.0, "Mistral": 5.0, "Nvidia AI": 5.0,
     "Microsoft Research": 5.0,
 }
 
-# Hard-news action verbs in title — something actually HAPPENED (not just discussed)
 _HARD_NEWS_VERB_RE = re.compile(
     r'\b(?:signs?|signed|passes?|passed|announces?|announced|cuts?|raises?|hikes?|'
     r'bans?|banning|arrests?|arrested|resigns?|resigned|fires?|fired|sacks?|sacked|'
@@ -214,7 +279,6 @@ _HARD_NEWS_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Compiled regex for soft-news / noise detection (titles only)
 _SOFT_NEWS_RE = re.compile(
     r'(?:opinion|analysis|review|explainer|column)\s*[:\-]'
     r'|\bhow\s+to\s+\w+'
@@ -227,7 +291,6 @@ _SOFT_NEWS_RE = re.compile(
     r'|\bin\s+pictures\b'
     r'|weekly\s+(?:roundup|wrap)'
     r'|monthly\s+digest'
-    # Analysis/explainer formats not tagged explicitly
     r'|\ball\s+about\s+(?:the|how|why|what)\b'
     r'|\bwhy\s+(?:is|are|did|does|the|india|pakistan|china|us|iran)\b'
     r'|\bhow\s+(?:\w+\s+){1,3}(?:is|are)\s+(?:driving|reshaping|affecting|impacting|changing|redefining)\b'
@@ -238,7 +301,6 @@ _SOFT_NEWS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# LIVE blog/update articles — constantly-updating but less useful as discrete news
 _LIVE_BLOG_RE = re.compile(
     r'\blive\s*(?:updates?|blog|ticker|news|coverage)\s*[:\-]?'
     r'|\blive\s*:\s'
@@ -247,7 +309,6 @@ _LIVE_BLOG_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Compiled regex for numeric magnitude (scale of real-world impact)
 _CASUALTY_RE = re.compile(
     r'\b\d[\d,]*\s*(?:killed|dead|died|casualties|wounded|injured|missing)\b',
     re.IGNORECASE,
@@ -262,40 +323,27 @@ _MARKET_MOVE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Breaking/urgency signals — used by editors only for genuinely major stories.
-# "live updates" / "live:" deliberately excluded: they're chronic live-blog markers,
-# not one-time breaking news; they get their own penalty in _LIVE_BLOG_RE.
 BREAKING_SIGNALS = [
     "breaking", "breaking news", "just in", "urgent", "alert", "developing",
     "flash:", "exclusive:", "at this hour",
 ]
 
-# High-impact importance signals — scale, severity, historic nature
 IMPORTANCE_SIGNALS = [
-    # Historic/unprecedented
     "record high", "record low", "all-time high", "all-time low", "historic",
     "landmark", "unprecedented", "first ever", "first time in history",
-    # Catastrophic events
     "catastrophic", "devastating", "collapse", "explosion", "blast",
     "earthquake", "floods", "disaster",
-    # Casualties / human impact
     "killed", "dead", "casualties", "death toll", "fatalities", "wounded",
     "missing", "plane crash", "train crash",
-    # Major decisions / legal
     "arrested", "indicted", "convicted", "sentenced", "ban", "banned",
     "parliament passes", "bill passed", "supreme court rules", "court orders",
     "declares emergency", "emergency declared", "martial law",
-    # Economic scale
     "billion dollar", "trillion", "market crash", "stock market crash",
     "currency crisis", "debt default", "bankruptcy", "bank collapse",
-    # Political shocks
     "resignation", "resigned", "ousted", "coup", "impeached", "fired",
     "invasion", "attack", "war declared", "ceasefire declared",
 ]
 
-# Football match outcome detection — distinguishes results from previews.
-# Use past/completed forms only: "wins" (3rd person result), not "win" (infinitive preview).
-# "beat X 2-0" = result; "must beat X" = preview — avoid infinitive forms.
 _FOOTBALL_OUTCOME_RE = re.compile(
     r'\b(?:\d\s*[-–]\s*\d|wins\b|win\s+\d|loses?\b|beaten\b|'
     r'victory\b|defeats?\b|thrash(?:es)?\b|hammer(?:s)?\b|demolish(?:es)?\b|'
@@ -305,7 +353,6 @@ _FOOTBALL_OUTCOME_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Major competitions — presence elevates importance
 _FOOTBALL_COMPETITIONS_RE = re.compile(
     r'\b(?:premier\s+league|champions\s+league|la\s+liga|bundesliga|serie\s+a|'
     r'ligue\s+1|europa\s+league|conference\s+league|fa\s+cup|carabao\s+cup|'
@@ -314,39 +361,27 @@ _FOOTBALL_COMPETITIONS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Football-specific importance signals
 FOOTBALL_IMPORTANCE_SIGNALS = [
-    # High-stakes competitions
     "champions league", "world cup", "euro 2024", "euro 2025", "euro 2026",
     "copa america", "europa league", "fa cup", "carabao cup", "community shield",
     "conference league", "supercopa", "dfb-pokal",
-    # Stage of competition
     "final", "semi-final", "semifinal", "quarter-final", "quarterfinal",
     "knockout stage", "round of 16", "last 16", "last 8", "group stage",
-    # Decisive outcomes
     "wins title", "crowned champions", "lifts the trophy", "relegated",
     "promotion", "promoted", "qualifies", "qualification", "advances",
     "knocked out", "eliminat", "title race", "title decider",
-    # Big match events
     "hat-trick", "brace", "red card", "penalty shootout", "extra time",
     "comeback", "comeback victory", "thriller", "stunner", "upset",
     "derby", "el clasico", "north west derby", "merseyside derby",
-    # Transfer news
     "record transfer", "world record", "transfer confirmed", "officially signs",
     "unveiled", "done deal", "departure confirmed", "free agent signs",
-    # Managerial
     "sacked", "appointed manager", "new manager", "manager resigns",
     "interim manager",
-    # Player news
     "injured", "ruled out", "long-term injury", "suspended", "banned",
     "returns from injury", "retirement announced", "retires",
 ]
 
-# AI/ML weighted keyword dict — specific/rare terms score far higher than broad ones.
-# Weights represent editorial signal strength: frontier model names score highest,
-# generic terms like "ai" very low to prevent inflation.
 AI_HIGH_IMPACT_KEYWORDS = {
-    # Frontier model names — very high signal, almost always newsworthy
     "gpt-5": 8.0, "gpt-4o": 5.0, "o3": 6.0, "o4": 7.0,
     "claude 4": 8.0, "claude 3.7": 6.0, "claude 3.5": 5.0,
     "gemini 2.0": 6.0, "gemini ultra": 6.0, "gemini 2.5": 7.0,
@@ -354,7 +389,6 @@ AI_HIGH_IMPACT_KEYWORDS = {
     "deepseek r2": 7.0, "deepseek v3": 6.0, "deepseek r1": 5.0,
     "grok 3": 6.0, "grok 2": 4.0,
     "mistral large": 5.0, "mistral small": 3.0,
-    # High-impact techniques / milestones
     "state of the art": 4.0, "sota": 3.5, "outperforms": 3.0, "surpasses": 3.0,
     "beats gpt": 5.0, "beats claude": 5.0, "beats gemini": 5.0,
     "constitutional ai": 4.0, "alignment": 3.0, "safety": 2.0,
@@ -368,87 +402,49 @@ AI_HIGH_IMPACT_KEYWORDS = {
     "diffusion": 2.0, "text-to-image": 2.0, "text-to-video": 3.0,
     "benchmark": 1.5, "mmlu": 3.0, "humaneval": 3.0, "swe-bench": 3.5,
     "lora": 1.5, "qlora": 2.0, "instruction tuning": 2.0, "fine-tuning": 1.5,
-    # Moderate signal — important but very common in arXiv papers
     "reinforcement learning": 1.5, "large language model": 1.0,
     "open source": 1.5, "open-source": 1.5,
     "llm": 0.8, "gpt": 1.5, "transformer": 0.8, "attention mechanism": 1.5,
-    # Common arXiv paper topics — low weight to prevent inflation
     "agent": 0.8, "embedding": 0.5, "retrieval": 0.5,
-    "rag": 0.8, "retrieval augmented": 1.2, "vector search": 1.0,
-    "multi-agent": 1.5, "benchmark": 0.8,
-    # Very broad terms (very low weight)
+    "multi-agent": 1.5,
     "neural network": 0.3, "machine learning": 0.3, "deep learning": 0.3,
     "ai": 0.2, "artificial intelligence": 0.3, "ml": 0.2,
 }
 
-# Source authority tiers for AI articles — lab blogs >> expert >> arXiv >> aggregator
 AI_SOURCE_TIERS = {
-    # Tier 1: frontier labs — primary source of groundbreaking work
     "OpenAI": 8.0, "Anthropic": 8.0, "DeepMind": 8.0,
     "Google AI": 7.0, "Meta AI": 7.0, "Mistral": 6.0, "Nvidia AI": 6.0,
     "Microsoft Research": 6.0, "Apple ML": 6.5, "Amazon Science": 5.5,
     "Together AI": 4.5,
-    # Tier 2: high-quality expert blogs & newsletters
     "Lil'Log": 6.0, "The Gradient": 5.0, "HuggingFace": 5.0,
     "The Batch": 5.0, "Import AI": 5.0, "Sebastian Raschka": 5.0,
     "Simon Willison": 4.5, "Chip Huyen": 5.0, "Jay Alammar": 4.5,
-    # Tier 2b: Google blogs
     "Google Developers": 3.5, "The Keyword Google": 3.0,
-    # Tier 2c: conference blogs
     "NeurIPS Blog": 6.0, "AAAI": 5.0,
-    # Tier 3: arXiv (high volume, variable quality)
-    "arXiv CS.CL": 2.0, "arXiv CS.AI": 2.0, "arXiv CS.LG": 2.0, "arXiv CS.IR": 1.5,
-    "arXiv CS.CV": 2.0, "arXiv CS.RO": 1.5, "arXiv CS.MA": 1.5, "arXiv stat.ML": 1.5,
-    # Tier 4: community / aggregated (social signal, not editorial)
+    "arXiv CS.CL": 2.0, "arXiv CS.AI": 2.0, "arXiv CS.LG": 2.0,
+    "arXiv CS.IR": 1.5, "arXiv CS.CV": 2.0, "arXiv CS.RO": 1.5,
+    "arXiv CS.MA": 1.5, "arXiv stat.ML": 1.5,
     "r/MachineLearning": 2.5, "r/LocalLLaMA": 2.0, "HN AI": 2.5,
     "Google AI News": 1.5,
-    # Tier 0: HuggingFace Daily Papers (curated trending — very high signal)
     "HF Daily Papers": 7.0,
 }
 
-# SOTA / breakthrough detection — something genuinely novel happened
-_AI_SOTA_RE = re.compile(
-    r'\b(?:state[- ]of[- ]the[- ]art|sota|outperforms?|surpasses?|'
-    r'beats?\s+(?:gpt|claude|gemini|llama)|new\s+record|best[- ]in[- ]class|'
-    r'first\s+to\s+achieve|breakthrough|game[- ]changing|unprecedented\s+performance)\b',
-    re.IGNORECASE,
-)
-
-# Novel work signals — paper/model introduction vs discussion
-_AI_NOVEL_RE = re.compile(
-    r'\b(?:we\s+(?:introduce|present|propose)|introducing\b|novel\s+approach|'
-    r'new\s+(?:method|framework|model|architecture)|(?:releases?|released|open[- ]source[sd])\b)\b',
-    re.IGNORECASE,
-)
-
-# Noise / low-value content — roundups, tutorials, getting-started guides
-_AI_NOISE_RE = re.compile(
-    r'\b(?:weekly\s+(?:digest|roundup|recap|wrap)|top\s+\d+\s+(?:papers?|tools?|models?|concepts?)|'
-    r'getting\s+started|cheat\s+sheet|beginner(?:\'s)?\s+guide|'
-    r'introduction\s+to\b|overview\s+of\b|course\s+(?:review|summary)|'
-    r'paper\s+summary|papers\s+this\s+week|this\s+week\s+in\s+ai|'
-    r'what\s+(?:is|are)\s+(?:a\s+|an\s+)?(?:llm|large\s+language|generative\s+ai|rag|ai\s+agent)|'
-    r'\w+\s+explained\s+in\s+under\s+\d+|'
-    r'\d+\s+\w+\s+(?:concepts?|techniques?|methods?)\s+explained)\b',
-    re.IGNORECASE,
-)
-
 CATEGORY_TAGS = {
     "Finance": ["market crash", "stock market", "sensex", "nifty", "bank nifty",
-                 "rbi", "investment", "economy", "gdp", "inflation", "rupee",
-                 "ipo", "sebi", "revenue", "profit", "crypto", "bitcoin",
-                 "budget", "fiscal", "forex", "trading", "bull market",
-                 "bear market", "mutual fund", "interest rate", "bond",
-                 "dow jones", "nasdaq", "s&p 500", "wall street", "fed rate",
-                 "earnings", "quarterly result", "share price", "commodity",
-                 "gold price", "crude oil", "banking", "fintech"],
+                "rbi", "investment", "economy", "gdp", "inflation", "rupee",
+                "ipo", "sebi", "revenue", "profit", "crypto", "bitcoin",
+                "budget", "fiscal", "forex", "trading", "bull market",
+                "bear market", "mutual fund", "interest rate", "bond",
+                "dow jones", "nasdaq", "s&p 500", "wall street", "fed rate",
+                "earnings", "quarterly result", "share price", "commodity",
+                "gold price", "crude oil", "banking", "fintech"],
     "AI": ["artificial intelligence", "chatgpt", "openai", "claude", "anthropic",
-            "gemini", "llm", "large language model", "generative ai", "gen ai",
-            "deepfake", "machine learning", "neural network", "ai model",
-            "ai regulation", "ai safety", "ai startup", "copilot", "midjourney",
-            "stable diffusion", "ai chip", "nvidia ai", "google ai", "meta ai",
-            "ai agent", "gpt-4", "gpt-5", "ai tool", "deepseek", "mistral",
-            "hugging face", "transformer", "ai investment", "ai company"],
+           "gemini", "llm", "large language model", "generative ai", "gen ai",
+           "deepfake", "machine learning", "neural network", "ai model",
+           "ai regulation", "ai safety", "ai startup", "copilot", "midjourney",
+           "stable diffusion", "ai chip", "nvidia ai", "google ai", "meta ai",
+           "ai agent", "gpt-4", "gpt-5", "ai tool", "deepseek", "mistral",
+           "hugging face", "transformer", "ai investment", "ai company"],
     "Tech": ["startup", "apple", "microsoft", "amazon", "meta", "nvidia",
              "software", "cyber", "digital", "5g", "semiconductor", "chip",
              "isro", "space", "elon musk", "tesla", "spacex", "iphone",
@@ -487,72 +483,75 @@ AI_CATEGORY_TAGS = {
     "RL": ["reinforcement learning", "rlhf", "reward model", "ppo", "dpo",
             "policy gradient", "q-learning", "rl from", "grpo"],
     "Retrieval": ["retrieval", "rag", "dense retrieval", "vector", "embedding",
-                   "search", "reranking", "rerank", "colbert", "bi-encoder"],
-    "Ranking": ["ranking", "learning to rank", "recommendation", "collaborative filtering",
-                 "click model", "ndcg", "relevance"],
+                  "search", "reranking", "rerank", "colbert", "bi-encoder"],
     "Agents": ["agent", "tool use", "function calling", "multi-agent", "agentic",
-                "planning", "web agent", "code agent", "mcp", "a2a"],
+               "planning", "web agent", "code agent", "mcp", "a2a"],
     "Reasoning": ["reasoning", "chain of thought", "cot", "tree of thought",
-                   "step-by-step", "math", "logic", "benchmark"],
+                  "step-by-step", "math", "logic", "benchmark"],
     "Vision": ["multimodal", "vision language", "image", "video", "diffusion",
-                "text-to-image", "mllm", "visual"],
+               "text-to-image", "mllm", "visual"],
 }
 
+_AI_SOTA_RE = re.compile(
+    r'\b(?:state[- ]of[- ]the[- ]art|sota|outperforms?|surpasses?|'
+    r'beats?\s+(?:gpt|claude|gemini|llama)|new\s+record|best[- ]in[- ]class|'
+    r'first\s+to\s+achieve|breakthrough|game[- ]changing|unprecedented\s+performance)\b',
+    re.IGNORECASE,
+)
+
+_AI_NOVEL_RE = re.compile(
+    r'\b(?:we\s+(?:introduce|present|propose)|introducing\b|novel\s+approach|'
+    r'new\s+(?:method|framework|model|architecture)|(?:releases?|released|open[- ]source[sd])\b)\b',
+    re.IGNORECASE,
+)
+
+_AI_NOISE_RE = re.compile(
+    r'\b(?:weekly\s+(?:digest|roundup|recap|wrap)|top\s+\d+\s+(?:papers?|tools?|models?|concepts?)|'
+    r'getting\s+started|cheat\s+sheet|beginner(?:\'s)?\s+guide|'
+    r'introduction\s+to\b|overview\s+of\b|course\s+(?:review|summary)|'
+    r'paper\s+summary|papers\s+this\s+week|this\s+week\s+in\s+ai|'
+    r'what\s+(?:is|are)\s+(?:a\s+|an\s+)?(?:llm|large\s+language|generative\s+ai|rag|ai\s+agent)|'
+    r'\w+\s+explained\s+in\s+under\s+\d+|'
+    r'\d+\s+\w+\s+(?:concepts?|techniques?|methods?)\s+explained)\b',
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Scoring functions
+# ---------------------------------------------------------------------------
 
 def _title_fingerprint(title: str) -> frozenset:
-    """Extract key content words from title for cross-source story clustering.
-
-    Strips trailing source attributions (e.g. '| India News', '| Hindustan Times')
-    that RSS feeds append — these inflate the fingerprint with outlet-specific noise
-    and lower the overlap ratio between articles covering the same story.
-    """
     STOP = {
         "the", "a", "an", "is", "are", "was", "were", "be", "been", "to", "of",
         "in", "on", "at", "for", "with", "by", "from", "and", "or", "but", "not",
         "as", "it", "its", "he", "she", "they", "we", "i", "this", "that", "which",
         "who", "has", "have", "had", "will", "would", "could", "should", "after",
-        "before", "over", "under", "up", "down", "says", "said", "says",
-        # Outlet noise words that appear in RSS title suffixes
+        "before", "over", "under", "up", "down", "says", "said",
         "news", "times", "post", "herald", "tribune", "express", "live", "today",
         "india", "daily", "online",
     }
-    # Strip trailing source attributions added by feeds: " | India News", " | Hindustan Times"
     clean = re.sub(r'\s*\|\s*.+$', '', title)
     words = re.findall(r'\b[a-z]+\b', clean.lower())
     return frozenset(w for w in words if w not in STOP and len(w) > 2)
 
 
 def _score_article(item: dict) -> float:
-    """Score article importance using multiplicative recency.
-
-    Formula: max(importance, 0) * recency_multiplier + source_authority
-
-    This ensures recency amplifies importance rather than replacing it —
-    a trivial recent article cannot outscore a genuinely important older one.
-    """
     title = item.get("title", "").lower()
     desc  = item.get("description", "").lower()
     pub   = item.get("published", "")
     importance = 0.0
 
-    # Keywords: title match = 3× weight (headline is the primary editorial signal).
-    # A keyword in a title means the article IS about that topic.
-    # In description it might just be context.
     for kw, weight in HIGH_PRIORITY_KEYWORDS.items():
         if kw in title:
             importance += weight * 3.0
         elif kw in desc:
             importance += weight * 0.8
 
-    # Breaking/urgency — editors only use these labels for genuinely major events
     for kw in BREAKING_SIGNALS:
         if kw in title:
             importance += 10.0
             break
 
-    # High-impact event signals — title match worth much more than description.
-    # "record high/low" separated: it fires too broadly (UK school attendance, stock records)
-    # and shouldn't score the same as plane crashes or market collapses.
     BROAD_RECORD_SIGNALS = {"record high", "record low", "all-time high", "all-time low"}
     for kw in IMPORTANCE_SIGNALS:
         if kw in title:
@@ -560,11 +559,9 @@ def _score_article(item: dict) -> float:
         elif kw in desc:
             importance += 1.5 if kw in BROAD_RECORD_SIGNALS else 3.0
 
-    # Hard-news action verb in title: something actually HAPPENED
     if _HARD_NEWS_VERB_RE.search(title):
         importance += 6.0
 
-    # Numeric magnitude — real-world scale in the headline
     if _CASUALTY_RE.search(title):
         importance += 14.0
     elif _CASUALTY_RE.search(desc):
@@ -576,16 +573,11 @@ def _score_article(item: dict) -> float:
     if _MARKET_MOVE_RE.search(title):
         importance += 8.0
 
-    # Soft-news / analysis penalty — drags importance below 0 so recency can't rescue it
     if _SOFT_NEWS_RE.search(title):
         importance -= 20.0
-
-    # LIVE blog penalty: live-blogs are constantly updated aggregations, not discrete news.
-    # Strong penalty so they rank well below individual news reports of the same story.
     if _LIVE_BLOG_RE.search(title):
         importance -= 15.0
 
-    # Hyperlocal foreign penalty
     text = title + " " + desc
     local_foreign = [
         "county", "sheriff", "township", "borough", "precinct", "school board",
@@ -594,8 +586,6 @@ def _score_article(item: dict) -> float:
     if any(lf in text for lf in local_foreign) and "india" not in text:
         importance -= 25.0
 
-    # Recency: exponential decay with configurable half-life.
-    # Breaking news decays with ~3hr half-life; non-breaking uses importance only.
     is_breaking = any(kw in title for kw in BREAKING_SIGNALS)
     age_h = None
     if pub:
@@ -608,33 +598,20 @@ def _score_article(item: dict) -> float:
         if age_h is None:
             recency_mult = 0.7
         else:
-            # Exponential decay: half-life ~3 hours, max 2.5x for very fresh
-            recency_mult = 2.5 * math.exp(-0.23 * max(age_h, 0))
-            recency_mult = max(recency_mult, 0.5)
+            recency_mult = max(2.5 * math.exp(-0.23 * max(age_h, 0)), 0.5)
     else:
-        recency_mult = 1.0  # flat — rank by importance only
+        recency_mult = 1.0
 
     source_boost = SOURCE_AUTHORITY.get(item.get("source", ""), 1.5)
     return max(importance, 0.0) * recency_mult + source_boost
 
 
 def _score_football_article(item: dict) -> float:
-    """Score football article using multiplicative recency (72-hr window).
-
-    Formula: max(importance, 0) * recency_multiplier + source_authority
-
-    Key design choices:
-    - Recency multipliers deliberately low (max 1.3) so that a genuinely
-      important older result is never buried by a trivial fresh preview.
-    - Outcome amplifier: competition + confirmed result × 2.5 importance.
-      A CL final result from 36h ago should always beat a CL preview from 1h ago.
-    """
     title = item.get("title", "").lower()
     desc  = item.get("description", "").lower()
     pub   = item.get("published", "")
     importance = 0.0
 
-    # Football importance signals — title match worth far more than description
     for kw in FOOTBALL_IMPORTANCE_SIGNALS:
         if kw in title:
             importance += 10.0
@@ -646,14 +623,11 @@ def _score_football_article(item: dict) -> float:
             importance += 10.0
             break
 
-    # Transfer fee / prize money magnitude
     if _BIG_MONEY_RE.search(title):
         importance += 12.0
     elif _BIG_MONEY_RE.search(desc):
         importance += 5.0
 
-    # Outcome amplifier: article confirmed a match result in a major competition.
-    # A result article is always more important than a preview of the same match.
     has_outcome = bool(_FOOTBALL_OUTCOME_RE.search(title))
     has_competition = bool(_FOOTBALL_COMPETITIONS_RE.search(title) or _FOOTBALL_COMPETITIONS_RE.search(desc))
     if has_outcome and has_competition:
@@ -661,12 +635,9 @@ def _score_football_article(item: dict) -> float:
     elif has_outcome:
         importance *= 1.5
 
-    # Soft-news penalty (previews, opinion, listicles)
     if _SOFT_NEWS_RE.search(title):
         importance -= 20.0
 
-    # Recency: exponential decay with ~18hr half-life. Kept deliberately gentle
-    # so important older results beat trivial fresh previews. Max 1.3.
     age_h = None
     if pub:
         try:
@@ -676,34 +647,19 @@ def _score_football_article(item: dict) -> float:
     if age_h is None:
         recency_mult = 0.5
     else:
-        recency_mult = 1.3 * math.exp(-0.039 * max(age_h, 0))  # half-life ~18h
-        recency_mult = max(recency_mult, 0.1)
+        recency_mult = max(1.3 * math.exp(-0.039 * max(age_h, 0)), 0.1)
 
     source_boost = SOURCE_AUTHORITY.get(item.get("source", ""), 1.5)
     return max(importance, 0.0) * recency_mult + source_boost
 
 
 def _score_ai_article(item: dict) -> float:
-    """Score an AI research/blog article using multiplicative recency (3-month window).
-
-    Formula: max(importance, 0) * recency_multiplier + source_tier
-
-    Design:
-    - Title-biased keywords (title = 3× weight) so frontier model announcements
-      that lead with the model name score far above generic arXiv papers.
-    - SOTA/breakthrough regex boosts breakthrough results.
-    - Noise penalty collapses roundups/tutorials below the floor.
-    - 3-month recency window: important older papers still surface above fresh noise.
-    """
-    title = item.get("title", "").lower()
-    desc  = item.get("description", "").lower()
-    pub   = item.get("published", "")
+    title  = item.get("title", "").lower()
+    desc   = item.get("description", "").lower()
+    pub    = item.get("published", "")
     source = item.get("source", "")
     importance = 0.0
 
-    # Title-biased weighted keyword scoring.
-    # Keyword importance is capped at 12 to prevent keyword-rich arXiv titles
-    # from dominating; SOTA/novel signals (below) push past the cap.
     kw_importance = 0.0
     for kw, weight in AI_HIGH_IMPACT_KEYWORDS.items():
         if kw in title:
@@ -712,31 +668,24 @@ def _score_ai_article(item: dict) -> float:
             kw_importance += weight * 0.8
     importance += min(kw_importance, 12.0)
 
-    # SOTA / breakthrough detection
     if _AI_SOTA_RE.search(title):
         importance += 8.0
     elif _AI_SOTA_RE.search(desc):
         importance += 3.0
 
-    # Novel work (paper/model release) — "we introduce / releasing / open-sourced"
     if _AI_NOVEL_RE.search(title):
         importance += 5.0
 
-    # arXiv papers without any SOTA or novel signal are likely routine submissions.
-    # Apply a penalty so they don't rank above genuine announcements.
     is_arxiv = source.startswith("arXiv")
     has_signal = _AI_SOTA_RE.search(title) or _AI_NOVEL_RE.search(title)
     if is_arxiv and not has_signal:
         importance -= 6.0
 
-    # Noise penalty — roundups, tutorials, getting-started guides
     if _AI_NOISE_RE.search(title):
         importance -= 15.0
     if _SOFT_NEWS_RE.search(title):
         importance -= 10.0
 
-    # Recency: exponential decay with ~48hr half-life.
-    # Max 2.0 so a breakthrough from last week still beats fresh trivia.
     age_h = None
     if pub:
         try:
@@ -746,47 +695,35 @@ def _score_ai_article(item: dict) -> float:
     if age_h is None:
         recency_mult = 0.5
     else:
-        recency_mult = 2.0 * math.exp(-0.0145 * max(age_h, 0))  # half-life ~48h
-        recency_mult = max(recency_mult, 0.1)
+        recency_mult = max(2.0 * math.exp(-0.0145 * max(age_h, 0)), 0.1)
 
     source_boost = AI_SOURCE_TIERS.get(item.get("source", ""), 1.5)
     return max(importance, 0.0) * recency_mult + source_boost
 
 
 def _tag_article(item: dict) -> str:
-    """Assign a category tag to a news article using weighted keyword scoring."""
     title = item.get("title", "").lower()
-    desc = item.get("description", "").lower()
-    text = title + " " + desc
-    best_tag = ""
-    best_score = 0.0
+    desc  = item.get("description", "").lower()
+    text  = title + " " + desc
+    best_tag, best_score = "", 0.0
     for tag, keywords in CATEGORY_TAGS.items():
         score = 0.0
         for kw in keywords:
             if kw in text:
-                # Multi-word keywords are more specific → higher weight
                 weight = len(kw.split())
-                # Title matches are worth 3x description matches
-                if kw in title:
-                    score += weight * 3.0
-                else:
-                    score += weight * 1.0
+                score += weight * 3.0 if kw in title else weight * 1.0
         if score > best_score:
-            best_score = score
-            best_tag = tag
+            best_score, best_tag = score, tag
     return best_tag or "General"
 
 
 def _tag_ai_article(item: dict) -> str:
-    """Assign a category tag to an AI article."""
     text = (item.get("title", "") + " " + item.get("description", "")).lower()
-    best_tag = ""
-    best_count = 0
+    best_tag, best_count = "", 0
     for tag, keywords in AI_CATEGORY_TAGS.items():
         count = sum(1 for kw in keywords if kw in text)
         if count > best_count:
-            best_count = count
-            best_tag = tag
+            best_count, best_tag = count, tag
     return best_tag or "ML"
 
 
@@ -794,11 +731,15 @@ def _tag_ai_article(item: dict) -> str:
 # Google News URL resolver
 # ---------------------------------------------------------------------------
 
-def _resolve_google_news_url(gn_url: str) -> str:
-    """Decode a Google News redirect URL to the actual article URL."""
+async def _resolve_google_news_url(gn_url: str) -> str:
+    if _gnd_decoder is None:
+        return gn_url
     try:
-        result = new_decoderv1(gn_url, interval=None)
-        if result.get("status") and result.get("decoded_url"):
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: _gnd_decoder(gn_url, interval=None)
+        )
+        if isinstance(result, dict) and result.get("status") and result.get("decoded_url"):
             return result["decoded_url"]
     except Exception:
         pass
@@ -809,17 +750,53 @@ def _resolve_google_news_url(gn_url: str) -> str:
 # Feed helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_feed(source_name: str, url: str) -> list[dict]:
-    """Parse one RSS feed and return normalised items."""
+async def _fetch_feed(source_name: str, url: str) -> list[dict]:
+    """Fetch one RSS feed with ETag/LM conditional requests and circuit breaker."""
+    if _cb.is_open(url):
+        return _feed_items_cache.get(url, [])
+
+    req_headers: dict[str, str] = {}
+    cached_hdrs = _feed_http_cache.get(url, {})
+    if cached_hdrs.get("etag"):
+        req_headers["If-None-Match"] = cached_hdrs["etag"]
+    if cached_hdrs.get("last_modified"):
+        req_headers["If-Modified-Since"] = cached_hdrs["last_modified"]
+
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=12)
-        feed = feedparser.parse(resp.content)
+        resp = await _http_client.get(url, headers=req_headers)
+
+        if resp.status_code == 304:
+            _cb.record_success(url)
+            return _feed_items_cache.get(url, [])
+
+        resp.raise_for_status()
+        _cb.record_success(url)
+
+        # Store conditional-request headers for next call
+        new_hdrs: dict[str, str] = {}
+        if resp.headers.get("etag"):
+            new_hdrs["etag"] = resp.headers["etag"]
+        if resp.headers.get("last-modified"):
+            new_hdrs["last_modified"] = resp.headers["last-modified"]
+        if new_hdrs:
+            _feed_http_cache[url] = new_hdrs
+
+        content = resp.content
     except Exception:
-        return []
+        _cb.record_failure(url)
+        return _feed_items_cache.get(url, [])
+
+    # feedparser is CPU-bound; run in executor to avoid blocking the event loop
+    loop = asyncio.get_event_loop()
+    try:
+        feed = await loop.run_in_executor(None, lambda: feedparser.parse(content))
+    except Exception:
+        return _feed_items_cache.get(url, [])
 
     items = []
+    gn_indices = []
+
     for entry in feed.entries[:15]:
-        # Extract thumbnail
         thumb = ""
         if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
             thumb = entry.media_thumbnail[0].get("url", "")
@@ -831,9 +808,9 @@ def _fetch_feed(source_name: str, url: str) -> list[dict]:
                     thumb = mc["url"]
                     break
         if not thumb and hasattr(entry, "links"):
-            for link in entry.links:
-                if "image" in link.get("type", ""):
-                    thumb = link.get("href", "")
+            for lnk in entry.links:
+                if "image" in lnk.get("type", ""):
+                    thumb = lnk.get("href", "")
                     break
         if not thumb and hasattr(entry, "enclosures"):
             for enc in entry.enclosures:
@@ -841,7 +818,6 @@ def _fetch_feed(source_name: str, url: str) -> list[dict]:
                     thumb = enc.get("href", "")
                     break
 
-        # Parse date
         published = ""
         dt = entry.get("published_parsed") or entry.get("updated_parsed")
         if dt:
@@ -850,17 +826,18 @@ def _fetch_feed(source_name: str, url: str) -> list[dict]:
             except Exception:
                 pass
 
-        # Clean description (strip HTML)
         desc = entry.get("summary", "") or entry.get("description", "")
         desc = re.sub(r"<[^>]+>", "", desc).strip()
         if len(desc) > 220:
             desc = desc[:217] + "..."
 
         link = entry.get("link", "")
-        # Resolve Google News redirect URLs to actual article URLs
-        if "news.google.com" in link:
-            link = _resolve_google_news_url(link)
-
+        # Estimate reading time from description length as proxy for full article
+        # Average article ~800 words; scale from snippet (220 chars ≈ 40 words)
+        desc_words = len(desc.split())
+        estimated_wc = max(200, desc_words * 20)  # 1 snippet word ≈ 20 article words
+        reading_time = max(1, math.ceil(estimated_wc / 200))
+        idx = len(items)
         items.append({
             "title": entry.get("title", ""),
             "link": link,
@@ -868,71 +845,53 @@ def _fetch_feed(source_name: str, url: str) -> list[dict]:
             "published": published,
             "description": desc,
             "thumbnail": thumb,
+            "readingTime": reading_time,
         })
+        if "news.google.com" in link:
+            gn_indices.append(idx)
+
+    # Resolve Google News redirect URLs in parallel
+    if gn_indices:
+        resolved = await asyncio.gather(
+            *[_resolve_google_news_url(items[i]["link"]) for i in gn_indices],
+            return_exceptions=True,
+        )
+        for i, r in zip(gn_indices, resolved):
+            if isinstance(r, str):
+                items[i]["link"] = r
+
+    _feed_items_cache[url] = items
     return items
 
 
-def _fetch_all_feeds(category: str) -> list[dict]:
-    """Fetch all feeds for a category in parallel, score and rank."""
-    cached = _cached(f"feeds_{category}")
-    if cached is not None:
-        return cached
-
-    feeds = RSS_FEEDS.get(category, [])
-    all_items: list[dict] = []
-
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        futures = {pool.submit(_fetch_feed, name, url): name for name, url in feeds}
-        # For AI research, also pull in HuggingFace Daily Papers as a high-signal source
-        hf_future = None
-        if category == "ai_research":
-            hf_future = pool.submit(_fetch_hf_daily_papers)
-        for future in as_completed(futures):
-            try:
-                all_items.extend(future.result())
-            except Exception:
-                pass
-        if hf_future:
-            try:
-                hf_papers = hf_future.result()
-                for p in hf_papers:
-                    p["source"] = "HF Daily Papers"
-                all_items.extend(hf_papers)
-            except Exception:
-                pass
-
-    # Build cross-source fingerprints + source names for multi-outlet detection
+def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
+    """Deduplicate, score, cross-source-boost, and rank a flat list of feed items."""
     all_fingerprints = [_title_fingerprint(item["title"]) for item in all_items]
     all_sources      = [item.get("source", "") for item in all_items]
 
-    # Deduplicate by title similarity
     seen_titles: set[str] = set()
     unique: list[dict] = []
-    unique_indices: list[int] = []  # track original indices for cross-source lookup
-    is_ai = category == "ai_research"
+    unique_indices: list[int] = []
+    is_ai       = category == "ai_research"
     is_football = category == "football"
+
     for idx, item in enumerate(all_items):
         key = re.sub(r"\W+", "", item["title"].lower())[:50]
         if key not in seen_titles:
             seen_titles.add(key)
             if is_ai:
-                item["tag"] = _tag_ai_article(item)
+                item["tag"]   = _tag_ai_article(item)
                 item["score"] = _score_ai_article(item)
             elif is_football:
-                item["tag"] = _tag_article(item)
+                item["tag"]   = _tag_article(item)
                 item["score"] = _score_football_article(item)
             else:
-                item["tag"] = _tag_article(item)
+                item["tag"]   = _tag_article(item)
                 item["score"] = _score_article(item)
-            # Store fingerprint on item so diversity pass stays correct after sorting
             item["_fp"] = all_fingerprints[idx]
             unique.append(item)
             unique_indices.append(idx)
 
-    # Cross-source boost: stories covered by DIFFERENT outlets are more important.
-    # Same-feed duplicates are excluded so the signal reflects true editorial consensus.
-    # For AI: collapse all arXiv sub-feeds into one logical source so cross-category
-    # arXiv papers don't falsely boost each other (they're the same publisher).
     def _cross_source_name(src: str) -> str:
         return "arXiv" if src.startswith("arXiv") else src
 
@@ -941,31 +900,21 @@ def _fetch_all_feeds(category: str) -> list[dict]:
         item_source = _cross_source_name(all_sources[unique_indices[i]])
         if len(fp) < 2:
             continue
-        seen_cross_sources: set[str] = set()
+        seen_cross: set[str] = set()
         for j, (other_fp, other_src) in enumerate(zip(all_fingerprints, all_sources)):
             norm_src = _cross_source_name(other_src)
             if (j != unique_indices[i]
-                    and norm_src != item_source          # must be a different outlet
-                    and norm_src not in seen_cross_sources
+                    and norm_src != item_source
+                    and norm_src not in seen_cross
                     and len(other_fp) > 0
-                    # 0.45 threshold requires specific story overlap, not just shared topic words.
-                    # Lower threshold (0.35) caused broad-topic tech articles ("apple security")
-                    # to falsely amplify each other across many outlets.
                     and len(fp & other_fp) / max(len(fp), len(other_fp)) >= 0.45):
-                seen_cross_sources.add(norm_src)
-        cross_count = len(seen_cross_sources)
+                seen_cross.add(norm_src)
+        cross_count = len(seen_cross)
         if cross_count > 0:
-            # Cap at 12: multi-outlet coverage is important but shouldn't dominate over
-            # genuine importance score. 3.0/outlet means 4 outlets = +12, the max.
-            boost = min(cross_count * 3.0, 12.0)
-            item["score"] = item.get("score", 0) + boost
+            item["score"] = item.get("score", 0) + min(cross_count * 3.0, 12.0)
 
-    # Sort by score descending — pure importance ranking, no recency bucket guarantee.
     unique.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-    # Topic-diversity pass for top_news: cap same-topic articles at 3 per cluster
-    # so a single event (e.g. Iran war) doesn't consume the entire top-20.
-    # Fingerprints are stored on items so the pass stays correct after sorting.
     if category == "top_news":
         cluster_counts: list[int] = []
         cluster_fps: list[frozenset] = []
@@ -976,8 +925,7 @@ def _fetch_all_feeds(category: str) -> list[dict]:
             cluster_slot = -1
             for ci, cfp in enumerate(cluster_fps):
                 if len(fp) > 0 and len(cfp) > 0:
-                    overlap = len(fp & cfp) / max(len(fp), len(cfp))
-                    if overlap >= 0.50:
+                    if len(fp & cfp) / max(len(fp), len(cfp)) >= 0.50:
                         cluster_slot = ci
                         break
             if cluster_slot == -1:
@@ -989,11 +937,39 @@ def _fetch_all_feeds(category: str) -> list[dict]:
                 diverse.append(item)
         unique = diverse
 
-    limit = 50
-    result = unique[:limit]
-    # Strip internal _fp (frozenset) — not JSON serializable and not needed by the API
+    result = unique[:50]
     for item in result:
         item.pop("_fp", None)
+    return result
+
+
+async def _fetch_all_feeds(category: str) -> list[dict]:
+    """Return category feed items from cache, or fetch and process all."""
+    cached = _cached(f"feeds_{category}")
+    if cached is not None:
+        return cached
+
+    feeds = RSS_FEEDS.get(category, [])
+    tasks = [asyncio.create_task(_fetch_feed(n, u)) for n, u in feeds]
+
+    hf_task = None
+    if category == "ai_research":
+        hf_task = asyncio.create_task(_fetch_hf_daily_papers())
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    all_items: list[dict] = []
+    for r in results:
+        if isinstance(r, list):
+            all_items.extend(r)
+
+    if hf_task is not None:
+        hf_result = await hf_task
+        if isinstance(hf_result, list):
+            for p in hf_result:
+                p["source"] = "HF Daily Papers"
+            all_items.extend(hf_result)
+
+    result = _process_feeds(all_items, category)
     _set_cache(f"feeds_{category}", result)
     return result
 
@@ -1002,53 +978,257 @@ def _fetch_all_feeds(category: str) -> list[dict]:
 # Stock helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_stocks(market: str) -> list[dict]:
-    """Fetch all stocks for a market using yfinance."""
-    cached = _cached(f"stocks_{market}")
+_YF_HOSTS = ("query2.finance.yahoo.com", "query1.finance.yahoo.com")
+_YF_HEADERS = {"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"}
+
+# Crumb authentication — Yahoo Finance requires this since 2024 to avoid 429s
+_YF_CRUMB: str | None = None
+_YF_COOKIES: str = ""
+_YF_CRUMB_TS: float = 0.0
+_YF_CRUMB_TTL = 3600.0   # crumb valid ~1 hour
+_YF_CRUMB_LOCK = asyncio.Lock()
+
+
+async def _get_yf_crumb() -> tuple[str | None, str]:
+    """Return (crumb, cookie_str).  Fetches fresh crumb if stale; uses lock to
+    avoid thundering-herd on startup when all tickers are fetched concurrently."""
+    global _YF_CRUMB, _YF_COOKIES, _YF_CRUMB_TS
+    if _YF_CRUMB and time.time() - _YF_CRUMB_TS < _YF_CRUMB_TTL:
+        return _YF_CRUMB, _YF_COOKIES
+    async with _YF_CRUMB_LOCK:
+        # Double-check after acquiring lock (another coro may have refreshed)
+        if _YF_CRUMB and time.time() - _YF_CRUMB_TS < _YF_CRUMB_TTL:
+            return _YF_CRUMB, _YF_COOKIES
+        try:
+            # Step 1: land on finance.yahoo.com to receive session cookies
+            r = await _http_client.get(
+                "https://finance.yahoo.com/",
+                headers={**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"},
+                timeout=10.0,
+            )
+            cookie_str = "; ".join(f"{k}={v}" for k, v in r.cookies.items())
+            # Step 2: exchange cookies for a crumb token
+            r2 = await _http_client.get(
+                "https://query2.finance.yahoo.com/v1/test/getcrumb",
+                headers={**_YF_HEADERS, "Cookie": cookie_str},
+                timeout=6.0,
+            )
+            crumb = r2.text.strip().strip('"')
+            if crumb and 3 < len(crumb) < 50 and r2.status_code == 200:
+                _YF_CRUMB = crumb
+                _YF_COOKIES = cookie_str
+                _YF_CRUMB_TS = time.time()
+                return crumb, cookie_str
+        except Exception:
+            pass
+        return None, ""
+
+
+async def _fetch_one_stock(symbol: str, label: str) -> dict | None:
+    """Fetch a single ticker via Yahoo Finance chart API.
+    Uses crumb + cookie auth to avoid IP-based 429 rate-limiting."""
+    crumb, cookie_str = await _get_yf_crumb()
+    encoded = urllib.parse.quote(symbol)
+    params  = {"interval": "1d", "range": "1d", "includePrePost": "false"}
+    if crumb:
+        params["crumb"] = crumb
+    req_headers = dict(_YF_HEADERS)
+    if cookie_str:
+        req_headers["Cookie"] = cookie_str
+    for host in _YF_HOSTS:
+        try:
+            resp = await _http_client.get(
+                f"https://{host}/v8/finance/chart/{encoded}",
+                params=params, headers=req_headers, timeout=6.0,
+            )
+            if resp.status_code == 429:
+                # Crumb may have expired — invalidate so next call refreshes
+                _YF_CRUMB_TS = 0.0
+                continue
+            if resp.status_code != 200:
+                return None
+            data   = resp.json()
+            result = data.get("chart", {}).get("result")
+            if not result:
+                return None
+            meta  = result[0].get("meta", {})
+            price = meta.get("regularMarketPrice")
+            prev  = meta.get("previousClose") or meta.get("chartPreviousClose")
+            if price is None:
+                return None
+            change     = price - prev if prev else 0.0
+            change_pct = (change / prev * 100) if prev else 0.0
+            return {
+                "label":      label,
+                "symbol":     symbol,
+                "price":      round(float(price), 2),
+                "change":     round(float(change), 2),
+                "change_pct": round(float(change_pct), 2),
+                "currency":   meta.get("currency", "USD") or "USD",
+            }
+        except Exception:
+            continue
+    return None
+
+
+_NSE_HEADERS = {
+    "User-Agent": HEADERS["User-Agent"],
+    "Accept":     "application/json",
+    "Referer":    "https://www.nseindia.com/",
+}
+
+# Mapping: NSE index name → (app label, YF symbol, currency)
+_NSE_INDEX_MAP = {
+    "NIFTY 50":   ("NIFTY 50",   "^NSEI",    "INR"),
+    "NIFTY BANK": ("BANK NIFTY", "^NSEBANK",  "INR"),
+    "NIFTY IT":   ("NIFTY IT",   "^CNXIT",    "INR"),
+}
+
+# Mapping: world-indices symbol → (app label, app symbol, currency)
+_WI_SYMBOL_MAP = {
+    "^GSPC":  ("S&P 500",    "^GSPC",  "USD"),
+    "^IXIC":  ("NASDAQ",     "^IXIC",  "USD"),
+    "^DJI":   ("DOW JONES",  "^DJI",   "USD"),
+    "GC=F":   ("GOLD",       "GC=F",   "USD"),
+    "BZ=F":   ("BRENT CRUDE","BZ=F",   "USD"),
+    "^BSESN": ("SENSEX",     "^BSESN", "INR"),  # price computed from change data
+}
+
+
+async def _fetch_india_stocks_nse() -> list[dict]:
+    """NSE India allIndices API fallback — no auth required, covers NIFTY 50/BANK/IT."""
+    try:
+        resp = await _http_client.get(
+            "https://www.nseindia.com/api/allIndices",
+            headers=_NSE_HEADERS, timeout=8.0,
+        )
+        if resp.status_code != 200:
+            return []
+        index_map = {item["index"]: item for item in resp.json().get("data", [])}
+        results: list[dict] = []
+        for nse_name, (label, symbol, currency) in _NSE_INDEX_MAP.items():
+            idx = index_map.get(nse_name)
+            if not idx:
+                continue
+            last   = float(idx.get("last")          or 0)
+            prev   = float(idx.get("previousClose") or last)
+            change = float(idx.get("variation")     or (last - prev))
+            pct    = float(idx.get("percentChange") or ((change / prev * 100) if prev else 0))
+            if not last:
+                continue
+            results.append({
+                "label":      label,
+                "symbol":     symbol,
+                "price":      round(last,   2),
+                "change":     round(change, 2),
+                "change_pct": round(pct,    2),
+                "currency":   currency,
+            })
+        return results
+    except Exception:
+        return []
+
+
+async def _fetch_stocks_html(target_symbols: set[str]) -> list[dict]:
+    """Yahoo Finance world-indices HTML fallback — one 1MB page covers US + commodities."""
+    try:
+        resp = await _http_client.get(
+            "https://finance.yahoo.com/world-indices/",
+            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"},
+            timeout=12.0,
+        )
+        if resp.status_code != 200:
+            return []
+        html = resp.text
+        results: list[dict] = []
+        for yf_sym, (label, app_sym, currency) in _WI_SYMBOL_MAP.items():
+            if app_sym not in target_symbols:
+                continue
+            esc = re.escape(yf_sym)
+            def _val(field: str, _esc: str = esc, _html: str = html) -> str | None:
+                m = (re.search(rf'data-symbol="{_esc}"[^>]*data-field="{field}"[^>]*data-value="([^"]+)"', _html) or
+                     re.search(rf'data-field="{field}"[^>]*data-symbol="{_esc}"[^>]*data-value="([^"]+)"', _html))
+                return m.group(1) if m else None
+            price_s  = _val("regularMarketPrice")
+            change_s = _val("regularMarketChange")
+            pct_s    = _val("regularMarketChangePercent")
+            if price_s is None and change_s and pct_s:
+                # Compute price from change + percent (e.g. SENSEX has no direct price tag)
+                try:
+                    chg = float(change_s)
+                    pct_v = float(pct_s)
+                    if pct_v:
+                        prev = chg / (pct_v / 100)
+                        price_s = str(round(prev + chg, 2))
+                except (ValueError, ZeroDivisionError):
+                    pass
+            if price_s is None:
+                continue
+            try:
+                price  = float(price_s)
+                change = float(change_s) if change_s else 0.0
+                pct    = float(pct_s)    if pct_s    else 0.0
+            except ValueError:
+                continue
+            results.append({
+                "label":      label,
+                "symbol":     app_sym,
+                "price":      round(price,  2),
+                "change":     round(change, 2),
+                "change_pct": round(pct,    2),
+                "currency":   currency,
+            })
+        return results
+    except Exception:
+        return []
+
+
+async def _fetch_stocks(market: str) -> list[dict]:
+    cache_key = f"stocks_{market}"
+    cached = _cached(cache_key)
     if cached is not None:
         return cached
-
     symbols = STOCK_SYMBOLS.get(market, [])
-    label_map = {sym: label for label, sym in symbols}
-    sym_list = [sym for _, sym in symbols]
-
-    results: list[dict] = []
-    try:
-        tickers = yf.Tickers(" ".join(sym_list))
-        for sym in sym_list:
-            try:
-                info = tickers.tickers[sym].fast_info
-                price = float(info.last_price)
-                prev_close = float(info.previous_close)
-                change = price - prev_close
-                change_pct = (change / prev_close * 100) if prev_close else 0
-                currency = getattr(info, "currency", "USD") or "USD"
-
-                results.append({
-                    "label": label_map[sym],
-                    "symbol": sym,
-                    "price": round(price, 2),
-                    "change": round(change, 2),
-                    "change_pct": round(change_pct, 2),
-                    "currency": currency,
-                })
-            except Exception as e:
-                print(f"  Stock error {sym}: {e}")
-    except Exception as e:
-        print(f"  Batch stock fetch error: {e}")
-        traceback.print_exc()
-
+    tasks = [_fetch_one_stock(sym, label) for label, sym in symbols]
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
     order = {label: i for i, (label, _) in enumerate(symbols)}
-    results.sort(key=lambda x: order.get(x["label"], 99))
-    _set_cache(f"stocks_{market}", results)
-    return results
+    results = sorted(
+        [r for r in raw if isinstance(r, dict)],
+        key=lambda x: order.get(x["label"], 99),
+    )
+    if results:
+        _set_cache(cache_key, results)
+        return results
+
+    # --- Yahoo Finance rate-limited / unreachable — try fallback sources ---
+    fallback: list[dict] = []
+    if market == "india":
+        # NSE India: NIFTY 50, BANK NIFTY, NIFTY IT; SENSEX from world-indices HTML
+        nse_data = await _fetch_india_stocks_nse()
+        sensex_data = await _fetch_stocks_html({"^BSESN"})
+        seen_labels = {r["label"] for r in nse_data}
+        fallback = nse_data + [r for r in sensex_data if r["label"] not in seen_labels]
+    elif market in ("us", "commodities"):
+        target_syms = {sym for _, sym in symbols}
+        fallback = await _fetch_stocks_html(target_syms)
+
+    if fallback:
+        _set_cache(cache_key, fallback)
+        # Sort by the order defined in STOCK_SYMBOLS
+        fallback.sort(key=lambda x: order.get(x["label"], 99))
+        return fallback
+
+    # Last resort: return stale cached data
+    stale = _cache.get(cache_key)
+    if stale:
+        return stale["data"]
+    return []
 
 
 # ---------------------------------------------------------------------------
 # Football scores helpers
 # ---------------------------------------------------------------------------
 
-# Priority order: top European club leagues first, then UEFA, then internationals
 FOOTBALL_LEAGUES = [
     ("eng.1", "Premier League", "PL"),
     ("uefa.champions", "Champions League", "UCL"),
@@ -1058,47 +1238,37 @@ FOOTBALL_LEAGUES = [
     ("fra.1", "Ligue 1", "L1"),
     ("uefa.europa", "Europa League", "UEL"),
     ("uefa.europa.conf", "Conference League", "UECL"),
-    # Fallback international
     ("fifa.friendly", "International", "INTL"),
     ("uefa.nations", "Nations League", "UNL"),
 ]
 
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
 
-# Top-performing / marquee teams per league — only show matches involving these
 TOP_TEAMS = {
-    # Premier League — top 8ish
     "PL": {"arsenal", "man city", "liverpool", "chelsea", "man united",
-            "newcastle", "tottenham", "aston villa", "brighton", "nottm forest"},
-    # Champions League / Europa — all matches matter
-    "UCL": None,  # None = show all
+           "newcastle", "tottenham", "aston villa", "brighton", "nottm forest"},
+    "UCL": None,
     "UEL": None,
     "UECL": None,
-    # La Liga
     "LaLiga": {"real madrid", "barcelona", "atletico", "athletic", "villarreal",
                "real sociedad", "betis", "mallorca"},
-    # Bundesliga
     "BL": {"bayern", "leverkusen", "dortmund", "stuttgart", "rb leipzig",
-            "frankfurt", "freiburg"},
-    # Serie A
+           "frankfurt", "freiburg"},
     "SA": {"inter milan", "napoli", "atalanta", "juventus", "ac milan",
-            "lazio", "roma", "fiorentina", "bologna"},
-    # Ligue 1
+           "lazio", "roma", "fiorentina", "bologna"},
     "L1": {"psg", "paris saint-germain", "marseille", "monaco", "lille", "lyon"},
-    # Internationals — top nations
     "INTL": {"brazil", "argentina", "france", "england", "germany", "spain",
-              "portugal", "india", "italy", "netherlands", "belgium"},
-    "UNL": {"brazil", "argentina", "france", "england", "germany", "spain",
              "portugal", "india", "italy", "netherlands", "belgium"},
+    "UNL": {"brazil", "argentina", "france", "england", "germany", "spain",
+            "portugal", "india", "italy", "netherlands", "belgium"},
 }
 
 
-def _fetch_league_scores(league_code: str, league_name: str, short: str,
-                         date_range: str) -> list[dict]:
-    """Fetch finished match scores for one league from ESPN."""
+async def _fetch_league_scores(league_code: str, league_name: str, short: str,
+                                date_range: str) -> list[dict]:
     url = f"{ESPN_SCOREBOARD_URL.format(league=league_code)}?dates={date_range}&limit=50"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp = await _http_client.get(url)
         data = resp.json()
     except Exception:
         return []
@@ -1107,81 +1277,63 @@ def _fetch_league_scores(league_code: str, league_name: str, short: str,
     for event in data.get("events", []):
         comp = event.get("competitions", [{}])[0]
         status_obj = comp.get("status", {}).get("type", {})
-        state = status_obj.get("state", "")
+        state  = status_obj.get("state", "")
         detail = status_obj.get("shortDetail", "")
-
-        # Only show completed or in-progress matches
         if state not in ("post", "in"):
             continue
-
         teams = comp.get("competitors", [])
         if len(teams) < 2:
             continue
-
-        # ESPN: competitors[0] is home, competitors[1] is away
         home = teams[0]
         away = teams[1]
-
-        match_date = event.get("date", "")
-
         matches.append({
-            "event_id": event.get("id", ""),
+            "event_id":    event.get("id", ""),
             "league_code": league_code,
-            "home": home["team"].get("shortDisplayName", home["team"].get("displayName", "?")),
-            "away": away["team"].get("shortDisplayName", away["team"].get("displayName", "?")),
-            "home_score": home.get("score", "?"),
-            "away_score": away.get("score", "?"),
-            "home_logo": home["team"].get("logo", ""),
-            "away_logo": away["team"].get("logo", ""),
-            "league": league_name,
+            "home":        home["team"].get("shortDisplayName", home["team"].get("displayName", "?")),
+            "away":        away["team"].get("shortDisplayName", away["team"].get("displayName", "?")),
+            "home_score":  home.get("score", "?"),
+            "away_score":  away.get("score", "?"),
+            "home_logo":   home["team"].get("logo", ""),
+            "away_logo":   away["team"].get("logo", ""),
+            "league":      league_name,
             "league_short": short,
-            "status": "FT" if state == "post" else detail,
-            "date": match_date,
+            "status":      "FT" if state == "post" else detail,
+            "date":        event.get("date", ""),
         })
-
     return matches
 
 
-def _fetch_all_scores() -> list[dict]:
-    """Fetch scores from all leagues for the last 7 days."""
-    cached = _cached("football_scores", ttl=600)  # 10 min cache
+async def _fetch_all_scores() -> list[dict]:
+    cached = _cached("football_scores", ttl=1800)
     if cached is not None:
         return cached
 
-    now = datetime.now(timezone.utc)
+    now   = datetime.now(timezone.utc)
     start = now - timedelta(days=7)
     date_range = f"{start.strftime('%Y%m%d')}-{now.strftime('%Y%m%d')}"
 
+    tasks = [
+        asyncio.create_task(_fetch_league_scores(code, name, short, date_range))
+        for code, name, short in FOOTBALL_LEAGUES
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
     all_matches: list[dict] = []
     club_match_count = 0
+    for (code, name, short), r in zip(FOOTBALL_LEAGUES, results):
+        if isinstance(r, list):
+            is_intl = short in ("INTL", "UNL")
+            if not is_intl:
+                club_match_count += len(r)
+            all_matches.extend(r)
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = {}
-        for code, name, short in FOOTBALL_LEAGUES:
-            futures[pool.submit(_fetch_league_scores, code, name, short, date_range)] = short
-
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                short = futures[future]
-                # Track club matches vs internationals
-                is_intl = short in ("INTL", "UNL")
-                if not is_intl:
-                    club_match_count += len(result)
-                all_matches.extend(result)
-            except Exception:
-                pass
-
-    # If we have enough club matches, drop internationals
     if club_match_count >= 8:
         all_matches = [m for m in all_matches if m["league_short"] not in ("INTL", "UNL")]
 
-    # Filter to only matches involving top teams
     filtered = []
     for m in all_matches:
         top = TOP_TEAMS.get(m["league_short"])
         if top is None:
-            # None means show all (e.g. UCL, UEL)
             filtered.append(m)
             continue
         home_lc = m["home"].lower()
@@ -1190,252 +1342,104 @@ def _fetch_all_scores() -> list[dict]:
            any(t in away_lc or away_lc in t for t in top):
             filtered.append(m)
 
-    # Sort by date descending (most recent first)
     filtered.sort(key=lambda x: x.get("date", ""), reverse=True)
     _set_cache("football_scores", filtered)
     return filtered
 
 
 # ---------------------------------------------------------------------------
-# Trending Papers — HuggingFace Daily Papers + community signals
+# HuggingFace trending
 # ---------------------------------------------------------------------------
 
-def _fetch_hf_daily_papers() -> list[dict]:
-    """Fetch trending papers from HuggingFace Daily Papers API."""
+async def _fetch_hf_daily_papers() -> list[dict]:
     try:
-        resp = requests.get("https://huggingface.co/api/daily_papers", headers=HEADERS, timeout=12)
+        resp = await _http_client.get("https://huggingface.co/api/daily_papers")
         if resp.status_code != 200:
             return []
         papers = resp.json()
         items = []
         for p in papers[:30]:
-            paper = p.get("paper", {})
-            title = paper.get("title", "")
+            paper    = p.get("paper", {})
+            title    = paper.get("title", "")
             abstract = paper.get("summary", "")
             arxiv_id = paper.get("id", "")
             pub_date = paper.get("publishedAt", "")
-            upvotes = p.get("numUpvotes", 0)
+            upvotes  = paper.get("upvotes", 0)   # upvotes lives inside paper{}, not root
+            thumbnail = p.get("thumbnail", "")    # thumbnail is at root level
             if not title:
                 continue
             items.append({
-                "title": title,
-                "link": f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else "",
-                "source": "HF Daily Papers",
-                "published": pub_date,
+                "title":       title,
+                "link":        f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else "",
+                "source":      "HF Daily Papers",
+                "published":   pub_date,
                 "description": (abstract[:220] + "...") if len(abstract) > 220 else abstract,
-                "thumbnail": "",
-                "upvotes": upvotes,
-                "paper_id": arxiv_id,
+                "thumbnail":   thumbnail,
+                "upvotes":     upvotes,
+                "paper_id":    arxiv_id,
             })
         return items
     except Exception:
         return []
 
 
-def _fetch_hf_trending_models() -> list[dict]:
-    """Fetch popular models from HuggingFace API."""
+async def _fetch_hf_trending_models() -> list[dict]:
     try:
-        resp = requests.get(
+        resp = await _http_client.get(
             "https://huggingface.co/api/models",
             params={"sort": "likes", "direction": "-1", "limit": "15"},
-            headers=HEADERS, timeout=10,
         )
         if resp.status_code != 200:
             return []
         models = resp.json()
-        items = []
-        for m in models:
-            model_id = m.get("modelId", "") or m.get("id", "")
-            tags = m.get("tags", [])
-            pipeline = m.get("pipeline_tag", "")
-            likes = m.get("likes", 0)
-            downloads = m.get("downloads", 0)
-            items.append({
-                "model_id": model_id,
-                "pipeline": pipeline,
-                "tags": tags[:5],
-                "likes": likes,
-                "downloads": downloads,
-                "link": f"https://huggingface.co/{model_id}",
-            })
-        return items
+        return [
+            {
+                "model_id": m.get("modelId", "") or m.get("id", ""),
+                "pipeline": m.get("pipeline_tag", ""),
+                "tags":     m.get("tags", [])[:5],
+                "likes":    m.get("likes", 0),
+                "downloads": m.get("downloads", 0),
+                "link":     f"https://huggingface.co/{m.get('modelId', '') or m.get('id', '')}",
+            }
+            for m in models
+        ]
     except Exception:
         return []
 
 
-def _fetch_trending() -> dict:
-    """Fetch all trending data: daily papers + trending models."""
-    cached = _cached("trending_data", ttl=600)
+async def _fetch_trending() -> dict:
+    cached = _cached("trending_data", ttl=3600)
     if cached is not None:
         return cached
 
-    papers = []
-    models = []
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fp = pool.submit(_fetch_hf_daily_papers)
-        fm = pool.submit(_fetch_hf_trending_models)
-        try:
-            papers = fp.result()
-        except Exception:
-            pass
-        try:
-            models = fm.result()
-        except Exception:
-            pass
+    papers, models = await asyncio.gather(
+        _fetch_hf_daily_papers(),
+        _fetch_hf_trending_models(),
+        return_exceptions=True,
+    )
+    if not isinstance(papers, list):
+        papers = []
+    if not isinstance(models, list):
+        models = []
 
-    # Score and tag the daily papers using the AI scoring pipeline
-    for item in papers:
-        item["tag"] = _tag_ai_article(item)
-        item["score"] = _score_ai_article(item)
-        # Boost by community upvotes (log scale to prevent runaway)
-        upvotes = item.get("upvotes", 0)
+    for p in papers:
+        p["tag"]   = _tag_ai_article(p)
+        p["score"] = _score_ai_article(p)
+        upvotes = p.get("upvotes", 0)
         if upvotes > 0:
-            item["score"] += min(math.log2(upvotes + 1) * 2.0, 10.0)
+            p["score"] += min(math.log2(upvotes + 1) * 2.0, 10.0)
 
     papers.sort(key=lambda x: x.get("score", 0), reverse=True)
-
     result = {"papers": papers, "models": models}
     _set_cache("trending_data", result)
     return result
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Article helpers
 # ---------------------------------------------------------------------------
 
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-@app.route("/api/news/<category>")
-def api_news(category):
-    if category not in RSS_FEEDS:
-        return jsonify({"error": "Unknown category"}), 400
-    return jsonify(_fetch_all_feeds(category))
-
-
-@app.route("/api/stocks/<market>")
-def api_stocks(market):
-    if market not in STOCK_SYMBOLS:
-        return jsonify({"error": "Unknown market"}), 400
-    return jsonify(_fetch_stocks(market))
-
-
-@app.route("/api/stocks/all")
-def api_stocks_all():
-    """Return all markets combined."""
-    all_stocks = {}
-    for market in STOCK_SYMBOLS:
-        all_stocks[market] = _fetch_stocks(market)
-    return jsonify(all_stocks)
-
-
-@app.route("/api/scores")
-def api_scores():
-    return jsonify(_fetch_all_scores())
-
-
-@app.route("/api/trending")
-def api_trending():
-    """Return trending papers and models from HuggingFace."""
-    return jsonify(_fetch_trending())
-
-
-@app.route("/api/match/<league>/<event_id>")
-def api_match(league, event_id):
-    """Fetch detailed match stats from ESPN."""
-    cache_key = f"match_{league}_{event_id}"
-    cached = _cached(cache_key, ttl=600)
-    if cached is not None:
-        return jsonify(cached)
-
-    summary_url = (
-        f"https://site.api.espn.com/apis/site/v2/sports/soccer/"
-        f"{league}/summary?event={event_id}"
-    )
-    try:
-        resp = requests.get(summary_url, headers=HEADERS, timeout=12)
-        sdata = resp.json()
-    except Exception:
-        return jsonify({"error": "Failed to fetch match data"}), 502
-
-    # Header / score
-    header = sdata.get("header", {})
-    comps = header.get("competitions", [{}])[0]
-    competitors = comps.get("competitors", [])
-
-    teams = []
-    for c in competitors:
-        t = c.get("team", {})
-        logos = t.get("logos", [])
-        teams.append({
-            "name": t.get("displayName", "?"),
-            "short": t.get("abbreviation", ""),
-            "score": c.get("score", "?"),
-            "logo": logos[0].get("href", "") if logos else "",
-            "home_away": c.get("homeAway", ""),
-        })
-
-    # Boxscore stats — ESPN API key → friendly display label
-    STAT_KEYS = {
-        "Possession":       "Possession",
-        "SHOTS":            "Total Shots",
-        "ON GOAL":          "Shots on Target",
-        "Corner Kicks":     "Corner Kicks",
-        "Fouls":            "Fouls",
-        "Yellow Cards":     "Yellow Cards",
-        "Red Cards":        "Red Cards",
-        "Offsides":         "Offsides",
-        "Saves":            "Saves",
-        "Pass Completion %":"Pass Completion %",
-        "Accurate Passes":  "Accurate Passes",
-    }
-    team_stats = []
-    for t in sdata.get("boxscore", {}).get("teams", []):
-        stat_map = {s["label"]: s["displayValue"] for s in t.get("statistics", [])}
-        team_stats.append({
-            "name": t.get("team", {}).get("displayName", "?"),
-            "stats": {display: stat_map.get(api_key, "-") for api_key, display in STAT_KEYS.items()},
-        })
-
-    # Key events (goals, cards)
-    key_events = []
-    for ke in sdata.get("keyEvents", []):
-        etype = ke.get("type", {}).get("text", "")
-        if etype not in (
-            "Goal", "Yellow Card", "Red Card", "Substitution",
-            "Penalty - Scored", "Penalty - Missed", "Own Goal",
-        ):
-            continue
-        athletes = ke.get("participants", [])
-        athlete_name = ""
-        if athletes:
-            athlete_name = athletes[0].get("athlete", {}).get("displayName", "")
-        key_events.append({
-            "type": etype,
-            "clock": ke.get("clock", {}).get("displayValue", ""),
-            "team": ke.get("team", {}).get("displayName", ""),
-            "player": athlete_name,
-        })
-
-    # Game info
-    gi = sdata.get("gameInfo", {})
-    venue = gi.get("venue", {})
-
-    result = {
-        "teams": teams,
-        "stats": team_stats,
-        "events": key_events,
-        "venue": venue.get("fullName", ""),
-        "attendance": gi.get("attendance", ""),
-    }
-    _set_cache(cache_key, result)
-    return jsonify(result)
-
-
 def _extract_ld_json(html: str) -> dict | None:
-    """Extract article data from LD+JSON structured data embedded in HTML."""
     ld_blocks = re.findall(
         r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html, re.DOTALL,
@@ -1443,17 +1447,15 @@ def _extract_ld_json(html: str) -> dict | None:
     for block in ld_blocks:
         try:
             data = json.loads(block)
-            # Handle @graph arrays
             items = data if isinstance(data, list) else [data]
             for item in items:
                 if not isinstance(item, dict):
                     continue
                 atype = item.get("@type", "")
-                if atype in ("NewsArticle", "Article", "ReportageNewsArticle",
-                             "WebPage") or "Article" in str(atype):
+                if atype in ("NewsArticle", "Article", "ReportageNewsArticle", "WebPage") \
+                        or "Article" in str(atype):
                     body = item.get("articleBody", "")
                     if body and len(body) > 100:
-                        # Extract structured fields
                         authors = []
                         raw_author = item.get("author", [])
                         if isinstance(raw_author, dict):
@@ -1464,7 +1466,6 @@ def _extract_ld_json(html: str) -> dict | None:
                                     authors.append(a.get("name", ""))
                                 elif isinstance(a, str):
                                     authors.append(a)
-
                         img = ""
                         raw_img = item.get("image", item.get("thumbnailUrl", ""))
                         if isinstance(raw_img, dict):
@@ -1474,15 +1475,12 @@ def _extract_ld_json(html: str) -> dict | None:
                             img = first.get("url", "") if isinstance(first, dict) else str(first)
                         elif isinstance(raw_img, str):
                             img = raw_img
-
-                        pub = item.get("datePublished", "")
-
                         return {
-                            "title": item.get("headline", ""),
-                            "authors": [a for a in authors if a],
-                            "publish_date": pub,
-                            "top_image": img,
-                            "text": body,
+                            "title":        item.get("headline", ""),
+                            "authors":      [a for a in authors if a],
+                            "publish_date": item.get("datePublished", ""),
+                            "top_image":    img,
+                            "text":         body,
                         }
         except (json.JSONDecodeError, TypeError):
             continue
@@ -1490,7 +1488,6 @@ def _extract_ld_json(html: str) -> dict | None:
 
 
 def _extract_og_meta(html: str) -> dict:
-    """Extract Open Graph / meta tag fallback info."""
     def _meta(prop):
         m = re.search(
             rf'<meta[^>]*(?:property|name)=["\'](?:og:)?{prop}["\'][^>]*content=["\']([^"\']+)',
@@ -1498,171 +1495,16 @@ def _extract_og_meta(html: str) -> dict:
         )
         return m.group(1) if m else ""
     return {
-        "title": _meta("title"),
-        "description": _meta("description"),
-        "image": _meta("image"),
-        "author": _meta("author"),
+        "title":          _meta("title"),
+        "description":    _meta("description"),
+        "image":          _meta("image"),
+        "author":         _meta("author"),
         "published_time": _meta("article:published_time"),
     }
 
 
-@app.route("/api/article")
-def api_article():
-    """Fetch and parse a full article from its URL."""
-    url = request.args.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "Missing url parameter"}), 400
-
-    # Resolve Google News redirect URLs
-    if "news.google.com" in url:
-        url = _resolve_google_news_url(url)
-
-    # Check cache
-    cache_key = f"article_{url}"
-    cached = _cached(cache_key, ttl=1800)  # 30 min cache
-    if cached is not None:
-        return jsonify(cached)
-
-    # Special handling for arXiv
-    if "arxiv.org" in url:
-        return _parse_arxiv_article(url, cache_key)
-
-    try:
-        # First, fetch the raw HTML ourselves for LD+JSON / meta extraction
-        raw_resp = requests.get(url, headers=HEADERS, timeout=12)
-
-        # Some sites (NDTV, etc.) block server-side requests
-        if raw_resp.status_code in (403, 451):
-            return jsonify({"error": "blocked", "source_url": url}), 502
-
-        raw_html = raw_resp.text
-
-        title = ""
-        authors: list[str] = []
-        pub_date = ""
-        top_image = ""
-        images: list[str] = []
-        text = ""
-
-        # Strategy 1: LD+JSON structured data (most reliable for modern sites)
-        ld = _extract_ld_json(raw_html)
-        if ld and len(ld.get("text", "")) > 100:
-            title = ld["title"]
-            authors = ld["authors"]
-            pub_date = ld["publish_date"]
-            top_image = ld["top_image"]
-            text = ld["text"]
-
-        # Strategy 2: newspaper4k (good general parser)
-        if len(text) < 100:
-            try:
-                article = Article(url, headers=HEADERS)
-                article.html = raw_html
-                article.parse()
-                if len(article.text or "") > len(text):
-                    text = article.text
-                if not title:
-                    title = article.title or ""
-                if not authors and article.authors:
-                    authors = article.authors
-                if not pub_date and article.publish_date:
-                    pub_date = article.publish_date.isoformat()
-                if not top_image:
-                    top_image = article.top_image or ""
-                for img in article.images:
-                    if img not in images and img != top_image:
-                        images.append(img)
-                    if len(images) >= 4:
-                        break
-            except Exception:
-                pass
-
-        # Strategy 3: Regex fallback for <article>/<p> extraction
-        if len(text.strip()) < 100:
-            text = _fallback_extract_from_html(raw_html) or text
-
-        # Fill missing metadata from OG meta tags
-        og = _extract_og_meta(raw_html)
-        if not title:
-            title = og["title"]
-        if not top_image:
-            top_image = og["image"]
-        if not pub_date:
-            pub_date = og["published_time"]
-        if not authors and og["author"]:
-            authors = [og["author"]]
-
-        if top_image and top_image not in images:
-            images.insert(0, top_image)
-
-        if not text or len(text.strip()) < 50:
-            return jsonify({"error": "blocked", "source_url": url}), 502
-
-        result = {
-            "title": title,
-            "authors": authors,
-            "publish_date": pub_date,
-            "top_image": top_image,
-            "images": images[:5],
-            "text": text,
-            "source_url": url,
-        }
-        _set_cache(cache_key, result)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Failed to parse article: {str(e)}"}), 502
-
-
-def _parse_arxiv_article(url: str, cache_key: str):
-    """Parse an arXiv paper page for its abstract and metadata."""
-    # Ensure we're hitting the abstract page
-    abs_url = re.sub(r"/pdf/", "/abs/", url).split(".pdf")[0]
-    try:
-        resp = requests.get(abs_url, headers=HEADERS, timeout=12)
-        html = resp.text
-
-        title = ""
-        m = re.search(r'<meta name="citation_title"\s+content="([^"]+)"', html)
-        if m:
-            title = m.group(1)
-
-        authors = []
-        for m in re.finditer(r'<meta name="citation_author"\s+content="([^"]+)"', html):
-            authors.append(m.group(1))
-
-        abstract = ""
-        m = re.search(
-            r'<blockquote[^>]*class="abstract[^"]*"[^>]*>\s*(?:<span[^>]*>Abstract:</span>\s*)?(.*?)</blockquote>',
-            html, re.DOTALL,
-        )
-        if m:
-            abstract = re.sub(r"<[^>]+>", "", m.group(1)).strip()
-
-        # Get submission date
-        pub_date = ""
-        m = re.search(r'<meta name="citation_date"\s+content="([^"]+)"', html)
-        if m:
-            pub_date = m.group(1)
-
-        result = {
-            "title": title,
-            "authors": authors[:10],
-            "publish_date": pub_date,
-            "top_image": "",
-            "images": [],
-            "text": abstract,
-            "source_url": abs_url,
-        }
-        _set_cache(cache_key, result)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Failed to parse arXiv article: {str(e)}"}), 502
-
-
 def _fallback_extract_from_html(html: str) -> str:
-    """Fallback text extraction using regex on pre-fetched HTML."""
     try:
-        # Try to find <article> tag content
         m = re.search(r"<article[^>]*>(.*?)</article>", html, re.DOTALL)
         if not m:
             m = re.search(
@@ -1673,7 +1515,8 @@ def _fallback_extract_from_html(html: str) -> str:
             content = m.group(1)
             paragraphs = re.findall(r"<p[^>]*>(.*?)</p>", content, re.DOTALL)
             text = "\n\n".join(
-                re.sub(r"<[^>]+>", "", p).strip() for p in paragraphs if len(p.strip()) > 30
+                re.sub(r"<[^>]+>", "", p).strip()
+                for p in paragraphs if len(p.strip()) > 30
             )
             if len(text) > 100:
                 return text
@@ -1682,9 +1525,451 @@ def _fallback_extract_from_html(html: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# SSRF protection for image proxy
+# ---------------------------------------------------------------------------
+
+def _is_safe_url(url: str) -> bool:
+    """Return True only if the URL is http(s) and resolves to a public IP."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        ip_str = socket.gethostbyname(hostname)
+        ip = ipaddress.ip_address(ip_str)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _encode_webp(content: bytes, max_w: int = 400, max_h: int = 300) -> bytes:
+    """Resize image and encode as WebP. CPU-bound — run in executor."""
+    _ensure_pil()
+    import io
+    buf_in  = io.BytesIO(content)
+    img = _PILImage.open(buf_in)
+    img = img.convert("RGB")
+    img.thumbnail((max_w, max_h), _PILImage.Resampling.LANCZOS)
+    buf_out = io.BytesIO()
+    img.save(buf_out, format="WebP", quality=80)
+    return buf_out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+async def index(request: Request):
+    return templates.TemplateResponse(request, "index.html")
+
+
+@app.get("/sw.js")
+async def serve_sw():
+    """Serve service worker from root so its scope covers the entire app."""
+    sw_path = os.path.join(os.path.dirname(__file__), "static", "js", "sw.js")
+    try:
+        with open(sw_path, encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return Response(status_code=404)
+    return Response(
+        content=content,
+        media_type="application/javascript",
+        headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/manifest.json")
+async def serve_manifest():
+    path = os.path.join(os.path.dirname(__file__), "static", "manifest.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return Response(status_code=404)
+    return Response(content=content, media_type="application/json")
+
+
+@app.get("/api/news/{category}")
+async def api_news(category: str):
+    if category not in RSS_FEEDS:
+        return JSONResponse({"error": "Unknown category"}, status_code=400)
+    return JSONResponse(await _fetch_all_feeds(category))
+
+
+@app.get("/api/news/stream/{category}")
+async def api_news_stream(category: str):
+    """SSE endpoint: emits partial results as feeds arrive, final 'done' event."""
+    if category not in RSS_FEEDS:
+        return JSONResponse({"error": "Unknown category"}, status_code=400)
+
+    cache_key = f"feeds_{category}"
+
+    async def event_gen():
+        # Serve from cache immediately if fresh
+        cached = _cached(cache_key)
+        if cached is not None:
+            yield f"data: {json.dumps(cached)}\n\n"
+            yield "event: done\ndata: {}\n\n"
+            return
+
+        feeds = RSS_FEEDS.get(category, [])
+        queue: asyncio.Queue = asyncio.Queue()
+        task_count = len(feeds) + (1 if category == "ai_research" else 0)
+
+        async def fetch_one(name: str, url: str) -> None:
+            items = await _fetch_feed(name, url)
+            await queue.put(items)
+
+        async def fetch_hf() -> None:
+            papers = await _fetch_hf_daily_papers()
+            for p in papers:
+                p["source"] = "HF Daily Papers"
+            await queue.put(papers)
+
+        tasks = [asyncio.create_task(fetch_one(n, u)) for n, u in feeds]
+        if category == "ai_research":
+            tasks.append(asyncio.create_task(fetch_hf()))
+
+        all_items: list[dict] = []
+        done_count = 0
+        last_emit = time.monotonic()
+
+        try:
+            while done_count < task_count:
+                try:
+                    batch = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    break
+                all_items.extend(batch)
+                done_count += 1
+
+                now = time.monotonic()
+                # Emit partial every 4 feeds or every 2 seconds
+                if done_count % 4 == 0 or (now - last_emit) >= 2.0:
+                    partial = _process_feeds(list(all_items), category)
+                    yield f"data: {json.dumps(partial)}\n\n"
+                    last_emit = now
+        finally:
+            for t in tasks:
+                t.cancel()
+
+        final = _process_feeds(all_items, category)
+        _set_cache(cache_key, final)
+        yield f"data: {json.dumps(final)}\n\n"
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/stocks/all")
+async def api_stocks_all():
+    results = await asyncio.gather(*[_fetch_stocks(m) for m in STOCK_SYMBOLS])
+    return JSONResponse(dict(zip(STOCK_SYMBOLS.keys(), results)))
+
+
+@app.get("/api/stocks/{market}")
+async def api_stocks(market: str):
+    if market not in STOCK_SYMBOLS:
+        return JSONResponse({"error": "Unknown market"}, status_code=400)
+    return JSONResponse(await _fetch_stocks(market))
+
+
+@app.get("/api/scores")
+async def api_scores():
+    return JSONResponse(await _fetch_all_scores())
+
+
+@app.get("/api/trending")
+async def api_trending():
+    return JSONResponse(await _fetch_trending())
+
+
+@app.get("/api/match/{league}/{event_id}")
+async def api_match(league: str, event_id: str):
+    cache_key = f"match_{league}_{event_id}"
+    cached = _cached(cache_key, ttl=3600)
+    if cached is not None:
+        return JSONResponse(cached)
+
+    summary_url = (
+        f"https://site.api.espn.com/apis/site/v2/sports/soccer/"
+        f"{league}/summary?event={event_id}"
+    )
+    try:
+        resp  = await _http_client.get(summary_url)
+        sdata = resp.json()
+    except Exception:
+        return JSONResponse({"error": "Failed to fetch match data"}, status_code=502)
+
+    header      = sdata.get("header", {})
+    comps       = header.get("competitions", [{}])[0]
+    competitors = comps.get("competitors", [])
+
+    teams = []
+    for c in competitors:
+        t = c.get("team", {})
+        logos = t.get("logos", [])
+        teams.append({
+            "name":      t.get("displayName", "?"),
+            "short":     t.get("abbreviation", ""),
+            "score":     c.get("score", "?"),
+            "logo":      logos[0].get("href", "") if logos else "",
+            "home_away": c.get("homeAway", ""),
+        })
+
+    STAT_KEYS = {
+        "Possession": "Possession", "SHOTS": "Total Shots",
+        "ON GOAL": "Shots on Target", "Corner Kicks": "Corner Kicks",
+        "Fouls": "Fouls", "Yellow Cards": "Yellow Cards",
+        "Red Cards": "Red Cards", "Offsides": "Offsides", "Saves": "Saves",
+        "Pass Completion %": "Pass Completion %", "Accurate Passes": "Accurate Passes",
+    }
+    team_stats = []
+    for t in sdata.get("boxscore", {}).get("teams", []):
+        stat_map = {s["label"]: s["displayValue"] for s in t.get("statistics", [])}
+        team_stats.append({
+            "name":  t.get("team", {}).get("displayName", "?"),
+            "stats": {display: stat_map.get(api_key, "-") for api_key, display in STAT_KEYS.items()},
+        })
+
+    key_events = []
+    for ke in sdata.get("keyEvents", []):
+        etype = ke.get("type", {}).get("text", "")
+        if etype not in ("Goal", "Yellow Card", "Red Card", "Substitution",
+                         "Penalty - Scored", "Penalty - Missed", "Own Goal"):
+            continue
+        athletes = ke.get("participants", [])
+        athlete_name = athletes[0].get("athlete", {}).get("displayName", "") if athletes else ""
+        key_events.append({
+            "type":   etype,
+            "clock":  ke.get("clock", {}).get("displayValue", ""),
+            "team":   ke.get("team", {}).get("displayName", ""),
+            "player": athlete_name,
+        })
+
+    gi    = sdata.get("gameInfo", {})
+    venue = gi.get("venue", {})
+    result = {
+        "teams": teams, "stats": team_stats, "events": key_events,
+        "venue": venue.get("fullName", ""), "attendance": gi.get("attendance", ""),
+    }
+    _set_cache(cache_key, result)
+    return JSONResponse(result)
+
+
+@app.get("/api/article")
+async def api_article(url: str = Query(...)):
+    url = url.strip()
+    if not url:
+        return JSONResponse({"error": "Missing url parameter"}, status_code=400)
+
+    if "news.google.com" in url:
+        url = await _resolve_google_news_url(url)
+
+    cache_key = f"article_{url}"
+    cached = _cached(cache_key, ttl=7200)
+    if cached is not None:
+        return JSONResponse(cached)
+
+    if "arxiv.org" in url:
+        return await _parse_arxiv_article(url, cache_key)
+
+    try:
+        raw_resp = await _http_client.get(url)
+        if raw_resp.status_code in (403, 451):
+            return JSONResponse({"error": "blocked", "source_url": url}, status_code=502)
+        raw_html = raw_resp.text
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to fetch article: {e}"}, status_code=502)
+
+    title = ""
+    authors: list[str] = []
+    pub_date = ""
+    top_image = ""
+    images: list[str] = []
+    text = ""
+
+    ld = _extract_ld_json(raw_html)
+    if ld and len(ld.get("text", "")) > 100:
+        title     = ld["title"]
+        authors   = ld["authors"]
+        pub_date  = ld["publish_date"]
+        top_image = ld["top_image"]
+        text      = ld["text"]
+
+    if len(text) < 100:
+        try:
+            loop = asyncio.get_event_loop()
+
+            def _parse_with_trafilatura():
+                extracted = trafilatura.extract(
+                    raw_html,
+                    url=url,
+                    include_comments=False,
+                    include_tables=False,
+                    no_fallback=False,
+                    favor_precision=True,
+                )
+                meta = trafilatura.extract_metadata(raw_html, default_url=url)
+                return extracted or "", meta
+
+            extracted_text, meta = await loop.run_in_executor(None, _parse_with_trafilatura)
+            if len(extracted_text) > len(text):
+                text = extracted_text
+            if meta:
+                if not title and meta.title:
+                    title = meta.title
+                if not authors and meta.author:
+                    authors = [meta.author] if isinstance(meta.author, str) else list(meta.author)
+                if not pub_date and meta.date:
+                    pub_date = meta.date
+                if not top_image and meta.image:
+                    top_image = meta.image
+        except Exception:
+            pass
+
+    if len(text.strip()) < 100:
+        text = _fallback_extract_from_html(raw_html) or text
+
+    og = _extract_og_meta(raw_html)
+    if not title:
+        title = og["title"]
+    if not top_image:
+        top_image = og["image"]
+    if not pub_date:
+        pub_date = og["published_time"]
+    if not authors and og["author"]:
+        authors = [og["author"]]
+
+    if top_image and top_image not in images:
+        images.insert(0, top_image)
+
+    if not text or len(text.strip()) < 50:
+        return JSONResponse({"error": "blocked", "source_url": url}, status_code=502)
+
+    word_count   = len(text.split())
+    reading_time = max(1, math.ceil(word_count / 200))
+
+    result = {
+        "title":        title,
+        "authors":      authors,
+        "publish_date": pub_date,
+        "top_image":    top_image,
+        "images":       images[:5],
+        "text":         text,
+        "source_url":   url,
+        "readingTime":  reading_time,
+    }
+    _set_cache(cache_key, result)
+    return JSONResponse(result)
+
+
+async def _parse_arxiv_article(url: str, cache_key: str):
+    abs_url = re.sub(r"/pdf/", "/abs/", url).split(".pdf")[0]
+    try:
+        resp = await _http_client.get(abs_url)
+        html = resp.text
+
+        title = ""
+        m = re.search(r'<meta name="citation_title"\s+content="([^"]+)"', html)
+        if m:
+            title = m.group(1)
+
+        authors = [m.group(1) for m in re.finditer(
+            r'<meta name="citation_author"\s+content="([^"]+)"', html
+        )]
+
+        abstract = ""
+        m = re.search(
+            r'<blockquote[^>]*class="abstract[^"]*"[^>]*>\s*(?:<span[^>]*>Abstract:</span>\s*)?(.*?)</blockquote>',
+            html, re.DOTALL,
+        )
+        if m:
+            abstract = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+
+        pub_date = ""
+        m = re.search(r'<meta name="citation_date"\s+content="([^"]+)"', html)
+        if m:
+            pub_date = m.group(1)
+
+        word_count   = len(abstract.split())
+        reading_time = max(1, math.ceil(word_count / 200))
+
+        result = {
+            "title": title, "authors": authors[:10],
+            "publish_date": pub_date, "top_image": "", "images": [],
+            "text": abstract, "source_url": abs_url,
+            "readingTime": reading_time,
+        }
+        _set_cache(cache_key, result)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to parse arXiv article: {e}"}, status_code=502)
+
+
+@app.get("/api/img")
+async def api_img(url: str = Query(...)):
+    """Image proxy: fetch external image, resize, serve as WebP (SSRF-protected)."""
+    # SSRF check runs in executor (socket.gethostbyname is blocking)
+    loop = asyncio.get_event_loop()
+    safe = await loop.run_in_executor(None, lambda: _is_safe_url(url))
+    if not safe:
+        return Response(status_code=400)
+
+    # Use image-appropriate headers; shared client sends text/html Accept which
+    # causes some CDNs (BBC, etc.) to reject with 403.
+    img_headers = {
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "image/webp,image/avif,image/*,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+    }
+    try:
+        resp = await _http_client.get(url, headers=img_headers, timeout=8.0)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            # httpx follows redirects but log for debugging
+            pass
+        if resp.status_code != 200:
+            return Response(status_code=404)
+        content_type = resp.headers.get("content-type", "")
+        if not content_type.startswith("image/"):
+            return Response(status_code=404)
+
+        raw = resp.content
+        if _ensure_pil():
+            webp = await loop.run_in_executor(None, lambda: _encode_webp(raw))
+            return Response(
+                content=webp,
+                media_type="image/webp",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+        # Pillow not installed: pass through original
+        return Response(
+            content=raw,
+            media_type=content_type,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    except Exception:
+        return Response(status_code=404)
+
+
+# ---------------------------------------------------------------------------
+# Dev entry-point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5566))
-    debug = os.environ.get("FLASK_DEBUG", "1") == "1"
+    import uvicorn
+    port  = int(os.environ.get("PORT", 5566))
     print(f"\n  The Brief — Your Morning Intelligence")
     print(f"  Open http://localhost:{port} in your browser\n")
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
