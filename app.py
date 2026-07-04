@@ -159,6 +159,43 @@ STOCK_SYMBOLS = {
     ],
 }
 
+WEATHER_CODE_LABELS = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Rime fog",
+    51: "Light drizzle",
+    53: "Drizzle",
+    55: "Dense drizzle",
+    56: "Freezing drizzle",
+    57: "Freezing drizzle",
+    61: "Light rain",
+    63: "Rain",
+    65: "Heavy rain",
+    66: "Freezing rain",
+    67: "Freezing rain",
+    71: "Light snow",
+    73: "Snow",
+    75: "Heavy snow",
+    77: "Snow grains",
+    80: "Rain showers",
+    81: "Rain showers",
+    82: "Violent rain showers",
+    85: "Snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with hail",
+    99: "Thunderstorm with hail",
+}
+
+DEFAULT_WEATHER_LOCATION = {
+    "lat": 12.9716,
+    "lon": 77.5946,
+    "location": "Bangalore 560103",
+}
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -1745,6 +1782,202 @@ def _is_safe_url(url: str) -> bool:
         return False
 
 
+def _client_ip(request: Request) -> str:
+    # Prefer explicit real-IP headers used by deployed proxies/CDNs.
+    for header in ("cf-connecting-ip", "true-client-ip", "x-real-ip"):
+        candidate = request.headers.get(header, "").strip()
+        if candidate:
+            try:
+                ip = ipaddress.ip_address(candidate)
+                if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved):
+                    return candidate
+            except ValueError:
+                continue
+
+    # X-Forwarded-For may contain a chain of IPs. Use the first public one.
+    forwarded = request.headers.get("x-forwarded-for", "")
+    for part in forwarded.split(","):
+        candidate = part.strip()
+        if not candidate:
+            continue
+        try:
+            ip = ipaddress.ip_address(candidate)
+            if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved):
+                return candidate
+        except ValueError:
+            continue
+
+    host = getattr(request.client, "host", "") if request.client else ""
+    if host:
+        try:
+            ip = ipaddress.ip_address(host)
+            if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved):
+                return host
+        except ValueError:
+            pass
+    return ""
+
+
+def _weather_code_label(code: int | None) -> str:
+    if code is None:
+        return "Unknown"
+    return WEATHER_CODE_LABELS.get(int(code), "Unknown")
+
+
+def _format_location(parts: list[str]) -> str:
+    return ", ".join([p for p in parts if p])
+
+
+def _format_hour_label(iso_ts: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        return dt.strftime("%-I %p")
+    except Exception:
+        return iso_ts[11:16] if len(iso_ts) >= 16 else iso_ts
+
+
+async def _reverse_geocode(lat: float, lon: float) -> str:
+    cache_key = f"weather_geo_{round(lat, 2)}_{round(lon, 2)}"
+    cached = _cached(cache_key, ttl=86400)
+    if cached is not None:
+        return cached
+
+    try:
+        resp = await _http_client.get(
+            "https://geocoding-api.open-meteo.com/v1/reverse",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "count": 1,
+                "language": "en",
+                "format": "json",
+            },
+        )
+        data = resp.json()
+        results = data.get("results") or []
+        if results:
+            place = results[0]
+            location = _format_location([
+                place.get("name", ""),
+                place.get("admin1", ""),
+                place.get("country", ""),
+            ])
+            if location:
+                _set_cache(cache_key, location)
+                return location
+    except Exception:
+        pass
+    return ""
+
+
+async def _lookup_location_from_ip(request: Request) -> tuple[float | None, float | None, str]:
+    ip = _client_ip(request)
+    if not ip:
+        return None, None, ""
+
+    cache_key = f"weather_ip_{ip}"
+    cached = _cached(cache_key, ttl=3600)
+    if cached is not None:
+        return cached.get("lat"), cached.get("lon"), cached.get("location", "")
+
+    try:
+        resp = await _http_client.get(f"https://ipwho.is/{ip}")
+        data = resp.json()
+        if data.get("success"):
+            lat = data.get("latitude")
+            lon = data.get("longitude")
+            location = _format_location([
+                data.get("city", ""),
+                data.get("region", ""),
+                data.get("country", ""),
+            ])
+            cached_data = {"lat": lat, "lon": lon, "location": location}
+            _set_cache(cache_key, cached_data)
+            return lat, lon, location
+    except Exception:
+        pass
+    return None, None, ""
+
+
+async def _fetch_weather_payload(request: Request, lat: float | None = None, lon: float | None = None) -> dict:
+    if lat is None or lon is None:
+        lat, lon, location = await _lookup_location_from_ip(request)
+        if lat is None or lon is None:
+            lat = DEFAULT_WEATHER_LOCATION["lat"]
+            lon = DEFAULT_WEATHER_LOCATION["lon"]
+            location = DEFAULT_WEATHER_LOCATION["location"]
+        elif not location:
+            location = DEFAULT_WEATHER_LOCATION["location"]
+    else:
+        location = await _reverse_geocode(lat, lon)
+        if not location:
+            _, _, ip_location = await _lookup_location_from_ip(request)
+            location = ip_location or DEFAULT_WEATHER_LOCATION["location"]
+
+    cache_key = f"weather_{round(float(lat), 2)}_{round(float(lon), 2)}"
+    cached = _cached(cache_key, ttl=600)
+    if cached is not None:
+        return cached
+
+    try:
+        resp = await _http_client.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day",
+                "hourly": "temperature_2m,weather_code,precipitation_probability,uv_index",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset",
+                "timezone": "auto",
+                "forecast_days": 1,
+            },
+        )
+        data = resp.json()
+    except Exception:
+        return {"error": "unavailable"}
+
+    current = data.get("current", {})
+    hourly = data.get("hourly", {})
+    times = hourly.get("time") or []
+    temps = hourly.get("temperature_2m") or []
+    codes = hourly.get("weather_code") or []
+    precips = hourly.get("precipitation_probability") or []
+    uvs = hourly.get("uv_index") or []
+    current_time = current.get("time")
+    start_idx = 0
+    if current_time in times:
+        start_idx = times.index(current_time)
+
+    forecast = []
+    for idx in range(start_idx, min(start_idx + 3, len(times))):
+        forecast.append({
+            "time": _format_hour_label(times[idx]),
+            "temp": round(float(temps[idx])) if idx < len(temps) and temps[idx] is not None else None,
+            "label": _weather_code_label(codes[idx] if idx < len(codes) else None),
+            "precip": precips[idx] if idx < len(precips) else None,
+        })
+
+    daily = (data.get("daily") or {})
+    result = {
+        "location": location or DEFAULT_WEATHER_LOCATION["location"],
+        "temperature": current.get("temperature_2m"),
+        "feels_like": current.get("apparent_temperature"),
+        "humidity": current.get("relative_humidity_2m"),
+        "wind": current.get("wind_speed_10m"),
+        "precipitation": precips[start_idx] if start_idx < len(precips) else None,
+        "uv_index": uvs[start_idx] if start_idx < len(uvs) else None,
+        "summary": _weather_code_label(current.get("weather_code")),
+        "is_day": current.get("is_day"),
+        "sunrise": daily.get("sunrise", [None])[0] if daily.get("sunrise") else None,
+        "sunset": daily.get("sunset", [None])[0] if daily.get("sunset") else None,
+        "high": daily.get("temperature_2m_max", [None])[0] if daily.get("temperature_2m_max") else None,
+        "low": daily.get("temperature_2m_min", [None])[0] if daily.get("temperature_2m_min") else None,
+        "forecast": forecast,
+    }
+    _set_cache(cache_key, result)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -1874,6 +2107,17 @@ async def api_scores(request: Request):
 
 async def api_trending(request: Request):
     return _json_gz_response(await _fetch_trending(), request)
+
+
+async def api_weather(request: Request):
+    lat = request.query_params.get("lat", "").strip()
+    lon = request.query_params.get("lon", "").strip()
+    try:
+        lat_f = float(lat) if lat else None
+        lon_f = float(lon) if lon else None
+    except ValueError:
+        return JSONResponse({"error": "invalid_coordinates"}, status_code=400)
+    return _json_gz_response(await _fetch_weather_payload(request, lat_f, lon_f), request)
 
 
 async def api_match(request: Request):
@@ -2203,6 +2447,7 @@ app = Starlette(
         Route("/api/stocks/{market}", api_stocks),
         Route("/api/scores", api_scores),
         Route("/api/trending", api_trending),
+        Route("/api/weather", api_weather),
         Route("/api/match/{league}/{event_id}", api_match),
         Route("/api/article", api_article),
         Route("/api/img", api_img),

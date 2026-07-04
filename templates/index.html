@@ -67,6 +67,43 @@
     </div>
   </section>
 
+  <!-- Local Weather -->
+  <section class="weather-panel" id="weatherPanel">
+    <div class="weather-card" id="weatherCard">
+      <div class="weather-head">
+        <div>
+          <div class="weather-kicker">LOCAL WEATHER</div>
+          <h2 class="weather-title">Your day at a glance</h2>
+        </div>
+        <div class="weather-tools">
+          <span class="weather-location" id="weatherLocation">Detected location pending...</span>
+          <button class="weather-refresh" id="weatherRefresh" type="button">Refresh</button>
+        </div>
+      </div>
+      <div class="weather-body">
+        <div class="weather-current">
+          <div class="weather-temp" id="weatherTemp">--&deg;</div>
+          <div class="weather-summary">
+            <div class="weather-condition" id="weatherCondition">Loading weather...</div>
+            <div class="weather-meta" id="weatherMeta"></div>
+          </div>
+        </div>
+        <div class="weather-forecast" id="weatherForecast">
+          <div class="weather-placeholder">Weather forecast will appear here.</div>
+        </div>
+      </div>
+      <div class="weather-local-news">
+        <div class="weather-local-news-head">
+          <span id="weatherLocalNewsTitle">Today in your city</span>
+          <span class="weather-local-news-note">Pulled from today's top stories</span>
+        </div>
+        <div class="weather-local-news-strip" id="weatherLocalNews">
+          <div class="weather-placeholder">Local stories will appear here after location loads.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Main Grid -->
   <main class="grid-main" id="gridMain">
 
@@ -148,11 +185,19 @@
   <!-- Match Scores Banner -->
   <section class="scores-banner">
     <div class="scores-banner-inner">
-      <div class="scores-label">RECENT SCORES</div>
+      <div class="scores-label-wrap">
+        <div class="scores-label">RECENT SCORES <span class="scores-count" id="scoresCount"></span></div>
+      </div>
       <div class="scores-track-wrap">
+        <button class="scores-nav" id="scoresPrev" type="button" aria-label="Scroll recent scores left">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
         <div class="scores-track" id="scoresTrack">
           <span class="scores-placeholder">Loading scores...</span>
         </div>
+        <button class="scores-nav" id="scoresNext" type="button" aria-label="Scroll recent scores right">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
       </div>
     </div>
   </section>

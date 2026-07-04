@@ -32,6 +32,15 @@
 
   function tagClass(tag) { return `tag-${tag || "General"}`; }
 
+  function escapeHtml(text) {
+    return String(text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
   /** Route external image URLs through the server-side proxy (WebP + SSRF safe). */
   function proxyImg(url) {
     if (!url || url.startsWith("data:") || url.startsWith("/api/img")) return url;
@@ -175,6 +184,10 @@
   // ── News Rendering ────────────────────────────────────────────────────
   let allTopNews = [];
   let allFootballItems = [];
+  let latestStockData = {};
+  let latestScores = [];
+  let latestTrending = [];
+  let latestWeather = null;
 
   function heroCard(item) {
     const bm = isBookmarked(item.link) ? " bookmarked" : "";
@@ -268,6 +281,7 @@
       allTopNews = items;
       renderNews(c, items, true);
       updateColCount("newsCount", items.length);
+      renderLocalNews();
     });
   }
 
@@ -386,6 +400,7 @@
       if (!r.ok) throw new Error();
       const data = await r.json();
       const papers = data.papers || [];
+      latestTrending = papers;
       if (!papers.length) {
         track.innerHTML = `<span class="trending-placeholder">No trending papers</span>`;
         return;
@@ -405,39 +420,185 @@
   }
 
   // ── Scores Banner ──────────────────────────────────────────────────────
+  const scoresTrack = $("#scoresTrack");
+  const scoresCount = $("#scoresCount");
+  const scoresPrev = $("#scoresPrev");
+  const scoresNext = $("#scoresNext");
+
   function scoreCard(m) {
-    return `<div class="score-card" data-event-id="${m.event_id}" data-league-code="${m.league_code}" style="cursor:pointer">
+    const when = m.date ? new Date(m.date) : null;
+    const dateLabel = when && !Number.isNaN(when.getTime())
+      ? when.toLocaleDateString("en-IN", { month: "short", day: "numeric" })
+      : "";
+    const cardTitle = `${m.home} ${m.home_score}-${m.away_score} ${m.away}${dateLabel ? ` · ${dateLabel}` : ""}${m.status ? ` · ${m.status}` : ""}`;
+    return `<div class="score-card" data-event-id="${m.event_id}" data-league-code="${m.league_code}" style="cursor:pointer" title="${escapeHtml(cardTitle)}">
       <span class="score-league league-${m.league_short}">${m.league_short}</span>
-      <div class="score-teams">
-        <span class="score-team">
-          ${m.home_logo ? `<img class="score-team-logo" src="${m.home_logo}" alt="" onerror="this.style.display='none'">` : ""}
-          <span class="score-team-name">${m.home}</span>
-        </span>
-        <span class="score-result">${m.home_score} - ${m.away_score}</span>
-        <span class="score-team">
-          <span class="score-team-name">${m.away}</span>
-          ${m.away_logo ? `<img class="score-team-logo" src="${m.away_logo}" alt="" onerror="this.style.display='none'">` : ""}
-        </span>
-      </div>
-      <span class="score-status">${m.status}</span>
+      <span class="score-team">
+        ${m.home_logo ? `<img class="score-team-logo" src="${m.home_logo}" alt="" onerror="this.style.display='none'">` : ""}
+        <span class="score-team-name">${m.home}</span>
+      </span>
+      <span class="score-result">${m.home_score} - ${m.away_score}</span>
+      <span class="score-team">
+        <span class="score-team-name">${m.away}</span>
+        ${m.away_logo ? `<img class="score-team-logo" src="${m.away_logo}" alt="" onerror="this.style.display='none'">` : ""}
+      </span>
     </div>`;
   }
 
   async function fetchScores() {
-    const track = $("#scoresTrack");
     try {
       const r = await fetch("/api/scores");
       if (!r.ok) throw new Error();
       const matches = await r.json();
+      latestScores = matches;
+      if (scoresCount) {
+        scoresCount.textContent = matches.length ? `(${matches.length})` : "";
+      }
       if (!matches.length) {
-        track.innerHTML = `<span class="scores-placeholder">No recent matches</span>`;
+        scoresTrack.innerHTML = `<span class="scores-placeholder">No recent matches</span>`;
         return;
       }
-      const html = matches.map(scoreCard).join('<span class="score-sep"></span>');
-      track.innerHTML = html + '<span class="score-sep"></span>' + html;
+      scoresTrack.innerHTML = matches.map(scoreCard).join("");
     } catch {
-      track.innerHTML = `<span class="scores-placeholder">Scores unavailable</span>`;
+      scoresTrack.innerHTML = `<span class="scores-placeholder">Scores unavailable</span>`;
     }
+  }
+
+  function scrollScores(dir) {
+    if (!scoresTrack) return;
+    const card = scoresTrack.querySelector(".score-card");
+    const cardWidth = card ? card.getBoundingClientRect().width : 280;
+    scoresTrack.scrollBy({ left: dir * (cardWidth + 12), behavior: "smooth" });
+  }
+
+  if (scoresPrev && scoresNext) {
+    scoresPrev.addEventListener("click", () => scrollScores(-1));
+    scoresNext.addEventListener("click", () => scrollScores(1));
+  }
+
+  // ── Weather ──────────────────────────────────────────────────────────
+  const weatherLocation = $("#weatherLocation");
+  const weatherTemp = $("#weatherTemp");
+  const weatherCondition = $("#weatherCondition");
+  const weatherMeta = $("#weatherMeta");
+  const weatherForecast = $("#weatherForecast");
+  const weatherLocalNews = $("#weatherLocalNews");
+  const weatherLocalNewsTitle = $("#weatherLocalNewsTitle");
+  const weatherRefresh = $("#weatherRefresh");
+
+  function weatherChip(label, value) {
+    return `<span class="weather-chip"><span class="muted">${label}</span> ${value}</span>`;
+  }
+
+  function weatherHourCard(hour) {
+    return `<div class="weather-hour">
+      <div class="weather-hour-time">${hour.time}</div>
+      <div class="weather-hour-temp">${hour.temp}&deg;</div>
+      <div class="weather-hour-meta">${hour.label}${hour.precip != null ? ` · ${hour.precip}% rain` : ""}</div>
+    </div>`;
+  }
+
+  function normalizeText(text) {
+    return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  }
+
+  function locationTerms(location) {
+    const raw = String(location || "")
+      .replace(/^Detected:\s*/i, "")
+      .replace(/^Location:\s*/i, "")
+      .trim();
+    if (!raw) return [];
+    const parts = raw.split(",").map((p) => p.trim()).filter(Boolean);
+    const terms = [...parts];
+    const city = parts[0] || "";
+    const cityAliases = {
+      bengaluru: ["bangalore"],
+      bangalore: ["bengaluru"],
+      mumbai: ["bombay"],
+      kolkata: ["calcutta"],
+      chennai: ["madras"],
+      delhi: ["new delhi"],
+    };
+    const cityKey = normalizeText(city);
+    if (cityAliases[cityKey]) terms.push(...cityAliases[cityKey]);
+    if (parts.length >= 2) terms.push(parts[1]);
+    return [...new Set(terms.map((t) => t.trim()).filter(Boolean))];
+  }
+
+  function renderLocalNews() {
+    if (!weatherLocalNews || !weatherLocalNewsTitle) return;
+    const location = latestWeather?.location || "";
+    const terms = locationTerms(location);
+    const titleBase = location
+      ? location.replace(/^Detected:\s*/i, "").split(",")[0].trim()
+      : "your city";
+    weatherLocalNewsTitle.textContent = `Today in ${titleBase}`;
+
+    if (!allTopNews.length) {
+      weatherLocalNews.innerHTML = `<div class="weather-placeholder">Local stories will appear after the news feed loads.</div>`;
+      return;
+    }
+
+    const pool = [...allTopNews];
+    const picked = [];
+    if (terms.length) {
+      for (const item of pool) {
+        const hay = normalizeText([item.title, item.description, item.source, item.tag].filter(Boolean).join(" "));
+        if (terms.some((term) => hay.includes(normalizeText(term)))) {
+          picked.push(item);
+        }
+        if (picked.length >= 4) break;
+      }
+    }
+
+    const items = picked.length ? picked : pool.slice(0, 4);
+    weatherLocalNews.innerHTML = items.slice(0, 4).map((item) => `
+      <a href="${item.link}" target="_blank" rel="noopener" class="weather-local-news-card">
+        <span class="news-tag ${tagClass(item.tag)}">${item.tag || "News"}</span>
+        <span class="weather-local-news-title">${escapeHtml(item.title)}</span>
+      </a>
+    `).join("");
+  }
+
+  function renderWeather(data) {
+    if (!data || data.error) {
+      if (weatherLocation) weatherLocation.textContent = data?.error === "location_unavailable" ? "Location not identified" : "Weather unavailable";
+      if (weatherTemp) weatherTemp.textContent = "--";
+      if (weatherCondition) weatherCondition.textContent = data?.error === "location_unavailable" ? "Enable location access to see local weather." : "Could not load weather right now.";
+      if (weatherMeta) weatherMeta.innerHTML = "";
+      if (weatherForecast) weatherForecast.innerHTML = `<div class="weather-placeholder">No forecast available.</div>`;
+      if (weatherLocalNewsTitle) weatherLocalNewsTitle.textContent = "Today in your city";
+      if (weatherLocalNews) weatherLocalNews.innerHTML = `<div class="weather-placeholder">Local stories will appear here after location loads.</div>`;
+      return;
+    }
+
+    latestWeather = data;
+    if (weatherLocation) weatherLocation.textContent = data.location ? `Detected: ${data.location}` : "Location not identified";
+    if (weatherTemp) weatherTemp.textContent = `${Math.round(data.temperature ?? 0)}°`;
+    if (weatherCondition) weatherCondition.textContent = data.summary || "Current conditions";
+    if (weatherMeta) {
+      weatherMeta.innerHTML = [
+        weatherChip("Feels", `${Math.round(data.feels_like ?? data.temperature ?? 0)}°`),
+        weatherChip("Humidity", `${data.humidity ?? "--"}%`),
+        weatherChip("Wind", `${Math.round(data.wind ?? 0)} km/h`),
+        weatherChip("Rain", `${data.precipitation ?? 0}%`),
+        weatherChip("UV", `${data.uv_index != null ? Number(data.uv_index).toFixed(1) : "--"}`),
+      ].join("");
+    }
+    if (weatherForecast) {
+      const hours = Array.isArray(data.forecast) ? data.forecast.slice(0, 3) : [];
+      weatherForecast.innerHTML = hours.length
+        ? hours.map(weatherHourCard).join("")
+        : `<div class="weather-placeholder">Short-term forecast unavailable.</div>`;
+    }
+    renderLocalNews();
+  }
+
+  function fetchWeather() {
+    return fetch("/api/weather")
+      .then((r) => r.ok ? r.json() : { error: "unavailable" })
+      .then(renderWeather)
+      .catch(() => renderWeather({ error: "unavailable" }));
   }
 
   // ── Article Reader Modal ──────────────────────────────────────────────
@@ -872,13 +1033,16 @@
       fetchTrending(),
     ]);
 
-    buildTicker(stockData || {});
+    latestStockData = stockData || {};
+    buildTicker(latestStockData);
+    fetchWeather();
     stampUpdate();
     btn.classList.remove("spinning");
   }
 
   loadAll();
   $("#refreshAll").addEventListener("click", loadAll);
+  if (weatherRefresh) weatherRefresh.addEventListener("click", () => fetchWeather());
 
   // No setInterval — SSE eliminates the need for scheduled polling.
   // Columns resize on window change.
