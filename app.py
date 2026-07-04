@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""The Brief — Personal news, stocks & search aggregator (FastAPI edition)."""
+"""The Brief — Personal news, stocks & search aggregator (Starlette edition)."""
 
 import asyncio
+import gc
+import gzip as _gzip
 import ipaddress
 import json
 import math
@@ -9,8 +11,8 @@ import os
 import re
 import socket
 import time
-import traceback
 import urllib.parse
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -22,36 +24,39 @@ try:
 except Exception:
     pass  # falls back to certifi — fine on Render/standard Linux
 
-import feedparser
+import xml.etree.ElementTree as ET
 import httpx
-import trafilatura
-from fastapi import FastAPI, Query, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.requests import Request
+from starlette.responses import Response, JSONResponse, StreamingResponse
+from starlette.routing import Route, Mount
+from starlette.staticfiles import StaticFiles
+from starlette.templating import Jinja2Templates
 
+# googlenewsdecoder is optional — skip Google News URL resolution if absent
+# to save ~5MB RAM. Google News links still work (browser follows redirect).
 try:
     from googlenewsdecoder import new_decoderv1 as _gnd_decoder
 except ImportError:
     _gnd_decoder = None
 
-_PILImage = None   # lazy-loaded on first image proxy request
-_io_mod    = None
-_PIL_AVAILABLE = None  # None = not yet checked; True/False after first attempt
+# Lazy-load trafilatura (heavy import: ~30MB with lxml trees, models, etc.)
+# Only loaded on first article extraction request if installed.
+_trafilatura = None
+_TRAFILATURA_AVAILABLE = None
 
-def _ensure_pil() -> bool:
-    global _PILImage, _io_mod, _PIL_AVAILABLE
-    if _PIL_AVAILABLE is not None:
-        return _PIL_AVAILABLE
+def _ensure_trafilatura():
+    global _trafilatura, _TRAFILATURA_AVAILABLE
+    if _TRAFILATURA_AVAILABLE is not None:
+        return _TRAFILATURA_AVAILABLE
     try:
-        from PIL import Image as _img
-        import io as _io
-        _PILImage = _img
-        _io_mod   = _io
-        _PIL_AVAILABLE = True
+        import trafilatura as _traf
+        _trafilatura = _traf
+        _TRAFILATURA_AVAILABLE = True
     except ImportError:
-        _PIL_AVAILABLE = False
-    return _PIL_AVAILABLE
+        _TRAFILATURA_AVAILABLE = False
+    return _TRAFILATURA_AVAILABLE
 
 # ---------------------------------------------------------------------------
 # HTTP client (lifecycle managed by lifespan)
@@ -61,20 +66,21 @@ _http_client: httpx.AsyncClient | None = None
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app):
     global _http_client
     _http_client = httpx.AsyncClient(
         headers=HEADERS,
-        timeout=httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=5.0),
-        limits=httpx.Limits(max_connections=60, max_keepalive_connections=20),
+        timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
+        limits=httpx.Limits(max_connections=12, max_keepalive_connections=5),
         follow_redirects=True,
     )
     yield
     await _http_client.aclose()
 
 
-app = FastAPI(lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# GZip compress all responses > 500 bytes — saves bandwidth + client memory
+from starlette.middleware.gzip import GZipMiddleware
+
 templates = Jinja2Templates(directory="templates")
 
 # ---------------------------------------------------------------------------
@@ -104,14 +110,12 @@ RSS_FEEDS = {
         ("Google Transfer News", "https://news.google.com/rss/search?q=football+transfer+news+2026&hl=en-IN&gl=IN&ceid=IN:en"),
     ],
     "ai_research": [
+        # Consolidated arXiv: keep top 4 (CL, AI, LG, CV); drop IR, RO, MA, stat.ML
         ("arXiv CS.CL", "https://rss.arxiv.org/rss/cs.CL"),
         ("arXiv CS.AI", "https://rss.arxiv.org/rss/cs.AI"),
         ("arXiv CS.LG", "https://rss.arxiv.org/rss/cs.LG"),
-        ("arXiv CS.IR", "https://rss.arxiv.org/rss/cs.IR"),
         ("arXiv CS.CV", "https://rss.arxiv.org/rss/cs.CV"),
-        ("arXiv CS.RO", "https://rss.arxiv.org/rss/cs.RO"),
-        ("arXiv CS.MA", "https://rss.arxiv.org/rss/cs.MA"),
-        ("arXiv stat.ML", "https://rss.arxiv.org/rss/stat.ML"),
+        # Lab blogs (high-signal, infrequent)
         ("OpenAI", "https://openai.com/blog/rss.xml"),
         ("Anthropic", "https://www.anthropic.com/rss/research.rss"),
         ("Google AI", "https://blog.research.google/feeds/posts/default?alt=rss"),
@@ -122,23 +126,16 @@ RSS_FEEDS = {
         ("Meta AI", "https://research.facebook.com/feed/"),
         ("Apple ML", "https://machinelearning.apple.com/rss.xml"),
         ("Amazon Science", "https://www.amazon.science/index.rss"),
-        ("Together AI", "https://www.together.ai/blog/rss.xml"),
-        ("Google Developers", "https://developers.googleblog.com/feeds/posts/default?alt=rss"),
-        ("The Keyword Google", "https://blog.google/rss/"),
         ("HuggingFace", "https://huggingface.co/blog/feed.xml"),
-        ("The Gradient", "https://thegradient.pub/rss/"),
+        # Curated newsletters/blogs (high signal-to-noise)
         ("Lil'Log", "https://lilianweng.github.io/index.xml"),
         ("The Batch", "https://www.deeplearning.ai/the-batch/feed/"),
         ("Import AI", "https://importai.substack.com/feed"),
-        ("Sebastian Raschka", "https://magazine.sebastianraschka.com/feed"),
         ("Simon Willison", "https://simonwillison.net/atom/everything/"),
-        ("Chip Huyen", "https://huyenchip.com/feed.xml"),
-        ("Jay Alammar", "https://jalammar.github.io/feed.xml"),
+        # Community (cap items heavily)
         ("r/MachineLearning", "https://www.reddit.com/r/MachineLearning/.rss"),
         ("r/LocalLLaMA", "https://www.reddit.com/r/LocalLLaMA/.rss"),
         ("HN AI", "https://hnrss.org/newest?q=LLM+OR+GPT+OR+transformer+OR+%22machine+learning%22"),
-        ("NeurIPS Blog", "https://blog.neurips.cc/feed/"),
-        ("AAAI", "https://aaai.org/feed/"),
         ("Google AI News", "https://news.google.com/rss/search?q=LLM+OR+large+language+model+OR+reinforcement+learning+OR+AI+agents+OR+RAG+retrieval&hl=en-US&gl=US&ceid=US:en"),
     ],
 }
@@ -170,24 +167,84 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
 }
 
-CACHE_TTL = 900  # seconds (15 min — feeds: top_news, football, ai_research, stocks)
+CACHE_TTL = 900        # 15 min — top_news, football, stocks
+CACHE_TTL_AI = 18000   # 5 hours — ai_research (papers change slowly)
 
 # ---------------------------------------------------------------------------
-# Simple in-memory cache
+# Size-bounded in-memory cache (LRU eviction)
 # ---------------------------------------------------------------------------
 
-_cache: dict = {}
+_CACHE_MAX_ENTRIES = 32  # upper bound on cache entries to cap memory
+
+class _LRUCache:
+    """Simple TTL + LRU cache with a hard size cap."""
+    __slots__ = ("_data", "_max")
+
+    def __init__(self, maxsize: int = _CACHE_MAX_ENTRIES):
+        self._data: OrderedDict = OrderedDict()
+        self._max = maxsize
+
+    def get(self, key: str, ttl: int = CACHE_TTL):
+        entry = self._data.get(key)
+        if entry and time.time() - entry["ts"] < ttl:
+            self._data.move_to_end(key)
+            return entry["data"]
+        if entry:
+            del self._data[key]  # expired — evict
+        return None
+
+    def set(self, key: str, data) -> None:
+        if key in self._data:
+            self._data.move_to_end(key)
+        self._data[key] = {"data": data, "ts": time.time()}
+        while len(self._data) > self._max:
+            self._data.popitem(last=False)
+
+    def raw_get(self, key: str):
+        """Get entry without TTL check (for stale fallback)."""
+        return self._data.get(key)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+
+_cache = _LRUCache(_CACHE_MAX_ENTRIES)
 
 
 def _cached(key: str, ttl: int = CACHE_TTL):
-    entry = _cache.get(key)
-    if entry and time.time() - entry["ts"] < ttl:
-        return entry["data"]
-    return None
+    return _cache.get(key, ttl)
 
 
 def _set_cache(key: str, data) -> None:
-    _cache[key] = {"data": data, "ts": time.time()}
+    _cache.set(key, data)
+
+
+# Pre-compressed JSON response cache — avoids re-serializing + re-compressing
+# on every request for the same cached data.
+_gz_cache: OrderedDict = OrderedDict()
+_GZ_CACHE_MAX = 16
+
+
+def _json_gz_response(data, request=None) -> Response:
+    """Return JSON, pre-compressed if client accepts gzip. Skips GZip middleware."""
+    accept_enc = request.headers.get("accept-encoding", "") if request else ""
+    if "gzip" in accept_enc:
+        data_id = id(data)
+        cached_gz = _gz_cache.get(data_id)
+        if cached_gz:
+            _gz_cache.move_to_end(data_id)
+        else:
+            raw = json.dumps(data, separators=(",", ":")).encode()
+            cached_gz = _gzip.compress(raw, compresslevel=4)
+            _gz_cache[data_id] = cached_gz
+            while len(_gz_cache) > _GZ_CACHE_MAX:
+                _gz_cache.popitem(last=False)
+        return Response(
+            content=cached_gz,
+            media_type="application/json",
+            headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
+        )
+    return JSONResponse(data)
 
 
 # ---------------------------------------------------------------------------
@@ -227,9 +284,12 @@ class CircuitBreaker:
 _cb = CircuitBreaker()
 
 # Per-feed HTTP conditional-request cache: url → {etag, last_modified}
-_feed_http_cache: dict[str, dict] = {}
-# Per-feed stale items (served on 304 or circuit-open)
-_feed_items_cache: dict[str, list] = {}
+# Bounded: only keeps headers for active feeds (~50 entries, tiny)
+_feed_http_cache: OrderedDict[str, dict] = OrderedDict()
+_FEED_HTTP_CACHE_MAX = 30
+# Per-feed stale items (served on 304 or circuit-open) — bounded
+_feed_items_cache: OrderedDict[str, list] = OrderedDict()
+_FEED_ITEMS_CACHE_MAX = 30
 
 # ---------------------------------------------------------------------------
 # Scoring constants (unchanged from v1)
@@ -415,15 +475,11 @@ AI_SOURCE_TIERS = {
     "OpenAI": 8.0, "Anthropic": 8.0, "DeepMind": 8.0,
     "Google AI": 7.0, "Meta AI": 7.0, "Mistral": 6.0, "Nvidia AI": 6.0,
     "Microsoft Research": 6.0, "Apple ML": 6.5, "Amazon Science": 5.5,
-    "Together AI": 4.5,
-    "Lil'Log": 6.0, "The Gradient": 5.0, "HuggingFace": 5.0,
-    "The Batch": 5.0, "Import AI": 5.0, "Sebastian Raschka": 5.0,
-    "Simon Willison": 4.5, "Chip Huyen": 5.0, "Jay Alammar": 4.5,
-    "Google Developers": 3.5, "The Keyword Google": 3.0,
-    "NeurIPS Blog": 6.0, "AAAI": 5.0,
+    "Lil'Log": 6.0, "HuggingFace": 5.0,
+    "The Batch": 5.0, "Import AI": 5.0,
+    "Simon Willison": 4.5,
     "arXiv CS.CL": 2.0, "arXiv CS.AI": 2.0, "arXiv CS.LG": 2.0,
-    "arXiv CS.IR": 1.5, "arXiv CS.CV": 2.0, "arXiv CS.RO": 1.5,
-    "arXiv CS.MA": 1.5, "arXiv stat.ML": 1.5,
+    "arXiv CS.CV": 2.0,
     "r/MachineLearning": 2.5, "r/LocalLLaMA": 2.0, "HN AI": 2.5,
     "Google AI News": 1.5,
     "HF Daily Papers": 7.0,
@@ -520,19 +576,30 @@ _AI_NOISE_RE = re.compile(
 # Scoring functions
 # ---------------------------------------------------------------------------
 
+_FP_STOP = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "to", "of",
+    "in", "on", "at", "for", "with", "by", "from", "and", "or", "but", "not",
+    "as", "it", "its", "he", "she", "they", "we", "i", "this", "that", "which",
+    "who", "has", "have", "had", "will", "would", "could", "should", "after",
+    "before", "over", "under", "up", "down", "says", "said",
+    "news", "times", "post", "herald", "tribune", "express", "live", "today",
+    "india", "daily", "online",
+})
+_FP_PIPE_RE = re.compile(r'\s*\|\s*.+$')
+_FP_WORD_RE = re.compile(r'\b[a-z]+\b')
+
+_BROAD_RECORD_SIGNALS = frozenset({"record high", "record low", "all-time high", "all-time low"})
+
+_LOCAL_FOREIGN = frozenset({
+    "county", "sheriff", "township", "borough", "precinct", "school board",
+    "state trooper", "local police", "neighborhood",
+})
+
+
 def _title_fingerprint(title: str) -> frozenset:
-    STOP = {
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "to", "of",
-        "in", "on", "at", "for", "with", "by", "from", "and", "or", "but", "not",
-        "as", "it", "its", "he", "she", "they", "we", "i", "this", "that", "which",
-        "who", "has", "have", "had", "will", "would", "could", "should", "after",
-        "before", "over", "under", "up", "down", "says", "said",
-        "news", "times", "post", "herald", "tribune", "express", "live", "today",
-        "india", "daily", "online",
-    }
-    clean = re.sub(r'\s*\|\s*.+$', '', title)
-    words = re.findall(r'\b[a-z]+\b', clean.lower())
-    return frozenset(w for w in words if w not in STOP and len(w) > 2)
+    clean = _FP_PIPE_RE.sub('', title)
+    words = _FP_WORD_RE.findall(clean.lower())
+    return frozenset(w for w in words if w not in _FP_STOP and len(w) > 2)
 
 
 def _score_article(item: dict) -> float:
@@ -552,12 +619,11 @@ def _score_article(item: dict) -> float:
             importance += 10.0
             break
 
-    BROAD_RECORD_SIGNALS = {"record high", "record low", "all-time high", "all-time low"}
     for kw in IMPORTANCE_SIGNALS:
         if kw in title:
-            importance += 4.0 if kw in BROAD_RECORD_SIGNALS else 8.0
+            importance += 4.0 if kw in _BROAD_RECORD_SIGNALS else 8.0
         elif kw in desc:
-            importance += 1.5 if kw in BROAD_RECORD_SIGNALS else 3.0
+            importance += 1.5 if kw in _BROAD_RECORD_SIGNALS else 3.0
 
     if _HARD_NEWS_VERB_RE.search(title):
         importance += 6.0
@@ -579,11 +645,7 @@ def _score_article(item: dict) -> float:
         importance -= 15.0
 
     text = title + " " + desc
-    local_foreign = [
-        "county", "sheriff", "township", "borough", "precinct", "school board",
-        "state trooper", "local police", "neighborhood",
-    ]
-    if any(lf in text for lf in local_foreign) and "india" not in text:
+    if any(lf in text for lf in _LOCAL_FOREIGN) and "india" not in text:
         importance -= 25.0
 
     is_breaking = any(kw in title for kw in BREAKING_SIGNALS)
@@ -780,66 +842,97 @@ async def _fetch_feed(source_name: str, url: str) -> list[dict]:
             new_hdrs["last_modified"] = resp.headers["last-modified"]
         if new_hdrs:
             _feed_http_cache[url] = new_hdrs
+            if len(_feed_http_cache) > _FEED_HTTP_CACHE_MAX:
+                _feed_http_cache.popitem(last=False)
 
         content = resp.content
     except Exception:
         _cb.record_failure(url)
         return _feed_items_cache.get(url, [])
 
-    # feedparser is CPU-bound; run in executor to avoid blocking the event loop
+    # Parse RSS/Atom with stdlib xml.etree — zero extra deps, ~8MB saved
     loop = asyncio.get_event_loop()
     try:
-        feed = await loop.run_in_executor(None, lambda: feedparser.parse(content))
+        root = await loop.run_in_executor(None, lambda: ET.fromstring(content))
     except Exception:
         return _feed_items_cache.get(url, [])
+    del content  # free raw RSS bytes
+
+    # Detect Atom vs RSS and extract namespace
+    ns = {}
+    tag = root.tag
+    if "}" in tag:
+        atom_ns = tag.split("}")[0] + "}"
+        ns["a"] = atom_ns.strip("{}")
+    media_ns = {"media": "http://search.yahoo.com/mrss/"}
+
+    # Find entries: RSS <item> or Atom <entry>
+    entries = root.findall(".//item")
+    if not entries:
+        entries = root.findall(f".//{{{ns.get('a', '')}}}entry") if ns.get("a") else root.findall(".//entry")
 
     items = []
     gn_indices = []
+    _strip_tags_re = re.compile(r"<[^>]+>")
 
-    for entry in feed.entries[:15]:
-        thumb = ""
-        if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
-            thumb = entry.media_thumbnail[0].get("url", "")
-        elif hasattr(entry, "media_content") and entry.media_content:
-            for mc in entry.media_content:
-                if "image" in mc.get("type", "") or mc.get("url", "").endswith(
-                    (".jpg", ".png", ".webp")
-                ):
-                    thumb = mc["url"]
-                    break
-        if not thumb and hasattr(entry, "links"):
-            for lnk in entry.links:
-                if "image" in lnk.get("type", ""):
-                    thumb = lnk.get("href", "")
-                    break
-        if not thumb and hasattr(entry, "enclosures"):
-            for enc in entry.enclosures:
-                if "image" in enc.get("type", ""):
-                    thumb = enc.get("href", "")
-                    break
+    for entry in entries[:8]:
+        def _txt(tag_name: str) -> str:
+            """Get text from a child element, trying plain and namespaced."""
+            el = entry.find(tag_name)
+            if el is None and ns.get("a"):
+                el = entry.find(f"{{{ns['a']}}}{tag_name}")
+            return (el.text or "").strip() if el is not None else ""
 
+        title = _txt("title")
+        # Link: RSS uses <link>text</link>, Atom uses <link href="..."/>
+        link = _txt("link")
+        if not link:
+            link_el = entry.find(f"{{{ns.get('a', '')}}}link") if ns.get("a") else entry.find("link")
+            if link_el is not None:
+                link = link_el.get("href", "") or (link_el.text or "")
+
+        # Published date
+        pub_text = _txt("pubDate") or _txt("published") or _txt("updated") or _txt("dc:date")
         published = ""
-        dt = entry.get("published_parsed") or entry.get("updated_parsed")
-        if dt:
-            try:
-                published = datetime(*dt[:6], tzinfo=timezone.utc).isoformat()
-            except Exception:
-                pass
+        if pub_text:
+            for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z",
+                        "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
+                        "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%d"):
+                try:
+                    published = datetime.strptime(pub_text.strip(), fmt).astimezone(timezone.utc).isoformat()
+                    break
+                except ValueError:
+                    continue
 
-        desc = entry.get("summary", "") or entry.get("description", "")
-        desc = re.sub(r"<[^>]+>", "", desc).strip()
-        if len(desc) > 220:
-            desc = desc[:217] + "..."
+        # Description
+        desc = _txt("description") or _txt("summary") or _txt("content")
+        desc = _strip_tags_re.sub("", desc).strip()
+        if len(desc) > 160:
+            desc = desc[:157] + "..."
 
-        link = entry.get("link", "")
-        # Estimate reading time from description length as proxy for full article
-        # Average article ~800 words; scale from snippet (220 chars ≈ 40 words)
+        # Thumbnail: media:thumbnail, media:content, enclosure
+        thumb = ""
+        for mt in entry.findall(f"{{{media_ns['media']}}}thumbnail"):
+            thumb = mt.get("url", "")
+            if thumb:
+                break
+        if not thumb:
+            for mc in entry.findall(f"{{{media_ns['media']}}}content"):
+                mc_url = mc.get("url", "")
+                if "image" in mc.get("type", "") or mc_url.endswith((".jpg", ".png", ".webp")):
+                    thumb = mc_url
+                    break
+        if not thumb:
+            enc = entry.find("enclosure")
+            if enc is not None and "image" in enc.get("type", ""):
+                thumb = enc.get("url", "")
+
         desc_words = len(desc.split())
-        estimated_wc = max(200, desc_words * 20)  # 1 snippet word ≈ 20 article words
+        estimated_wc = max(200, desc_words * 20)
         reading_time = max(1, math.ceil(estimated_wc / 200))
         idx = len(items)
         items.append({
-            "title": entry.get("title", ""),
+            "title": title,
             "link": link,
             "source": source_name,
             "published": published,
@@ -850,7 +943,8 @@ async def _fetch_feed(source_name: str, url: str) -> list[dict]:
         if "news.google.com" in link:
             gn_indices.append(idx)
 
-    # Resolve Google News redirect URLs in parallel
+    del root  # free XML tree
+
     if gn_indices:
         resolved = await asyncio.gather(
             *[_resolve_google_news_url(items[i]["link"]) for i in gn_indices],
@@ -861,22 +955,23 @@ async def _fetch_feed(source_name: str, url: str) -> list[dict]:
                 items[i]["link"] = r
 
     _feed_items_cache[url] = items
+    if len(_feed_items_cache) > _FEED_ITEMS_CACHE_MAX:
+        _feed_items_cache.popitem(last=False)
     return items
+
+
+_DEDUP_RE = re.compile(r"\W+")
 
 
 def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
     """Deduplicate, score, cross-source-boost, and rank a flat list of feed items."""
-    all_fingerprints = [_title_fingerprint(item["title"]) for item in all_items]
-    all_sources      = [item.get("source", "") for item in all_items]
-
     seen_titles: set[str] = set()
     unique: list[dict] = []
-    unique_indices: list[int] = []
     is_ai       = category == "ai_research"
     is_football = category == "football"
 
-    for idx, item in enumerate(all_items):
-        key = re.sub(r"\W+", "", item["title"].lower())[:50]
+    for item in all_items:
+        key = _DEDUP_RE.sub("", item["title"].lower())[:50]
         if key not in seen_titles:
             seen_titles.add(key)
             if is_ai:
@@ -888,28 +983,32 @@ def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
             else:
                 item["tag"]   = _tag_article(item)
                 item["score"] = _score_article(item)
-            item["_fp"] = all_fingerprints[idx]
+            # Compute fingerprint only for unique items (not all)
+            item["_fp"] = _title_fingerprint(item["title"])
             unique.append(item)
-            unique_indices.append(idx)
 
     def _cross_source_name(src: str) -> str:
         return "arXiv" if src.startswith("arXiv") else src
 
-    for i, item in enumerate(unique):
-        fp          = all_fingerprints[unique_indices[i]]
-        item_source = _cross_source_name(all_sources[unique_indices[i]])
+    # Build a compact index: source → list of fingerprints (one per unique item)
+    _src_fps: dict[str, list[frozenset]] = {}
+    for item in unique:
+        src = _cross_source_name(item.get("source", ""))
+        _src_fps.setdefault(src, []).append(item["_fp"])
+
+    for item in unique:
+        fp = item["_fp"]
+        item_source = _cross_source_name(item.get("source", ""))
         if len(fp) < 2:
             continue
-        seen_cross: set[str] = set()
-        for j, (other_fp, other_src) in enumerate(zip(all_fingerprints, all_sources)):
-            norm_src = _cross_source_name(other_src)
-            if (j != unique_indices[i]
-                    and norm_src != item_source
-                    and norm_src not in seen_cross
-                    and len(other_fp) > 0
-                    and len(fp & other_fp) / max(len(fp), len(other_fp)) >= 0.45):
-                seen_cross.add(norm_src)
-        cross_count = len(seen_cross)
+        cross_count = 0
+        for other_src, fps_list in _src_fps.items():
+            if other_src == item_source:
+                continue
+            for other_fp in fps_list:
+                if len(other_fp) > 0 and len(fp & other_fp) / max(len(fp), len(other_fp)) >= 0.45:
+                    cross_count += 1
+                    break  # one match per source is enough
         if cross_count > 0:
             item["score"] = item.get("score", 0) + min(cross_count * 3.0, 12.0)
 
@@ -937,20 +1036,29 @@ def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
                 diverse.append(item)
         unique = diverse
 
-    result = unique[:50]
+    result = unique[:30]
     for item in result:
         item.pop("_fp", None)
     return result
 
 
+_FEED_FETCH_SEM = asyncio.Semaphore(6)  # max 6 concurrent feed fetches to limit RAM spikes
+
+
+async def _fetch_feed_throttled(name: str, url: str) -> list[dict]:
+    async with _FEED_FETCH_SEM:
+        return await _fetch_feed(name, url)
+
+
 async def _fetch_all_feeds(category: str) -> list[dict]:
     """Return category feed items from cache, or fetch and process all."""
-    cached = _cached(f"feeds_{category}")
+    ttl = CACHE_TTL_AI if category == "ai_research" else CACHE_TTL
+    cached = _cached(f"feeds_{category}", ttl)
     if cached is not None:
         return cached
 
     feeds = RSS_FEEDS.get(category, [])
-    tasks = [asyncio.create_task(_fetch_feed(n, u)) for n, u in feeds]
+    tasks = [asyncio.create_task(_fetch_feed_throttled(n, u)) for n, u in feeds]
 
     hf_task = None
     if category == "ai_research":
@@ -971,6 +1079,9 @@ async def _fetch_all_feeds(category: str) -> list[dict]:
 
     result = _process_feeds(all_items, category)
     _set_cache(f"feeds_{category}", result)
+    # Free intermediate data and trigger GC after heavy processing
+    del all_items
+    gc.collect()
     return result
 
 
@@ -1024,12 +1135,67 @@ async def _get_yf_crumb() -> tuple[str | None, str]:
         return None, ""
 
 
-async def _fetch_one_stock(symbol: str, label: str) -> dict | None:
-    """Fetch a single ticker via Yahoo Finance chart API.
-    Uses crumb + cookie auth to avoid IP-based 429 rate-limiting."""
+async def _fetch_stocks_batch(symbols: list[tuple[str, str]]) -> list[dict]:
+    """Fetch ALL tickers in one v7/finance/quote call (batch).
+    Falls back to individual v8/chart calls if batch fails."""
+    if not symbols:
+        return []
+    crumb, cookie_str = await _get_yf_crumb()
+    sym_str = ",".join(sym for _, sym in symbols)
+    label_map = {sym: label for label, sym in symbols}
+    params = {"symbols": sym_str}
+    if crumb:
+        params["crumb"] = crumb
+    req_headers = dict(_YF_HEADERS)
+    if cookie_str:
+        req_headers["Cookie"] = cookie_str
+
+    for host in _YF_HOSTS:
+        try:
+            resp = await _http_client.get(
+                f"https://{host}/v7/finance/quote",
+                params=params, headers=req_headers, timeout=8.0,
+            )
+            if resp.status_code == 429:
+                _YF_CRUMB_TS = 0.0
+                continue
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            quotes = data.get("quoteResponse", {}).get("result", [])
+            results = []
+            for q in quotes:
+                sym = q.get("symbol", "")
+                label = label_map.get(sym, sym)
+                price = q.get("regularMarketPrice")
+                prev = q.get("regularMarketPreviousClose")
+                if price is None:
+                    continue
+                change = q.get("regularMarketChange", (price - prev) if prev else 0.0)
+                pct = q.get("regularMarketChangePercent", (change / prev * 100) if prev else 0.0)
+                results.append({
+                    "label":      label,
+                    "symbol":     sym,
+                    "price":      round(float(price), 2),
+                    "change":     round(float(change), 2),
+                    "change_pct": round(float(pct), 2),
+                    "currency":   q.get("currency", "USD") or "USD",
+                })
+            if results:
+                return results
+        except Exception:
+            continue
+    # Fallback: individual chart calls (slow but more reliable)
+    tasks = [_fetch_one_stock_chart(sym, label) for label, sym in symbols]
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
+    return [r for r in raw if isinstance(r, dict)]
+
+
+async def _fetch_one_stock_chart(symbol: str, label: str) -> dict | None:
+    """Fallback: fetch a single ticker via v8/chart API."""
     crumb, cookie_str = await _get_yf_crumb()
     encoded = urllib.parse.quote(symbol)
-    params  = {"interval": "1d", "range": "1d", "includePrePost": "false"}
+    params = {"interval": "1d", "range": "1d", "includePrePost": "false"}
     if crumb:
         params["crumb"] = crumb
     req_headers = dict(_YF_HEADERS)
@@ -1042,29 +1208,27 @@ async def _fetch_one_stock(symbol: str, label: str) -> dict | None:
                 params=params, headers=req_headers, timeout=6.0,
             )
             if resp.status_code == 429:
-                # Crumb may have expired — invalidate so next call refreshes
                 _YF_CRUMB_TS = 0.0
                 continue
             if resp.status_code != 200:
                 return None
-            data   = resp.json()
+            data = resp.json()
             result = data.get("chart", {}).get("result")
             if not result:
                 return None
-            meta  = result[0].get("meta", {})
+            meta = result[0].get("meta", {})
             price = meta.get("regularMarketPrice")
-            prev  = meta.get("previousClose") or meta.get("chartPreviousClose")
+            prev = meta.get("previousClose") or meta.get("chartPreviousClose")
             if price is None:
                 return None
-            change     = price - prev if prev else 0.0
+            change = price - prev if prev else 0.0
             change_pct = (change / prev * 100) if prev else 0.0
             return {
-                "label":      label,
-                "symbol":     symbol,
-                "price":      round(float(price), 2),
-                "change":     round(float(change), 2),
+                "label": label, "symbol": symbol,
+                "price": round(float(price), 2),
+                "change": round(float(change), 2),
                 "change_pct": round(float(change_pct), 2),
-                "currency":   meta.get("currency", "USD") or "USD",
+                "currency": meta.get("currency", "USD") or "USD",
             }
         except Exception:
             continue
@@ -1189,13 +1353,10 @@ async def _fetch_stocks(market: str) -> list[dict]:
     if cached is not None:
         return cached
     symbols = STOCK_SYMBOLS.get(market, [])
-    tasks = [_fetch_one_stock(sym, label) for label, sym in symbols]
-    raw = await asyncio.gather(*tasks, return_exceptions=True)
     order = {label: i for i, (label, _) in enumerate(symbols)}
-    results = sorted(
-        [r for r in raw if isinstance(r, dict)],
-        key=lambda x: order.get(x["label"], 99),
-    )
+    # Batch fetch: one HTTP call for all tickers in this market
+    results = await _fetch_stocks_batch(symbols)
+    results.sort(key=lambda x: order.get(x["label"], 99))
     if results:
         _set_cache(cache_key, results)
         return results
@@ -1219,7 +1380,7 @@ async def _fetch_stocks(market: str) -> list[dict]:
         return fallback
 
     # Last resort: return stale cached data
-    stale = _cache.get(cache_key)
+    stale = _cache.raw_get(cache_key)
     if stale:
         return stale["data"]
     return []
@@ -1237,14 +1398,9 @@ FOOTBALL_LEAGUES = [
     ("ita.1", "Serie A", "SA"),
     ("fra.1", "Ligue 1", "L1"),
     ("uefa.europa", "Europa League", "UEL"),
-    ("uefa.europa.conf", "Conference League", "UECL"),
-    ("fifa.friendly", "International", "INTL"),
-    ("uefa.nations", "Nations League", "UNL"),
     ("fifa.world", "FIFA World Cup", "WC"),
     ("uefa.euro", "UEFA European Championship", "EURO"),
-    ("conmebol.america", "Copa América", "COPA"),
-    ("caf.nations", "Africa Cup of Nations", "AFCON"),
-    ("concacaf.gold", "Concacaf Gold Cup", "GOLD"),
+    ("fifa.friendly", "International", "INTL"),
 ]
 
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
@@ -1254,7 +1410,6 @@ TOP_TEAMS = {
            "newcastle", "tottenham", "aston villa", "brighton", "nottm forest"},
     "UCL": None,
     "UEL": None,
-    "UECL": None,
     "LaLiga": {"real madrid", "barcelona", "atletico", "athletic", "villarreal",
                "real sociedad", "betis", "mallorca"},
     "BL": {"bayern", "leverkusen", "dortmund", "stuttgart", "rb leipzig",
@@ -1262,15 +1417,10 @@ TOP_TEAMS = {
     "SA": {"inter milan", "napoli", "atalanta", "juventus", "ac milan",
            "lazio", "roma", "fiorentina", "bologna"},
     "L1": {"psg", "paris saint-germain", "marseille", "monaco", "lille", "lyon"},
-    "INTL": {"brazil", "argentina", "france", "england", "germany", "spain",
-             "portugal", "india", "italy", "netherlands", "belgium"},
-    "UNL": {"brazil", "argentina", "france", "england", "germany", "spain",
-            "portugal", "india", "italy", "netherlands", "belgium"},
     "WC": None,
     "EURO": None,
-    "COPA": None,
-    "AFCON": None,
-    "GOLD": None,
+    "INTL": {"brazil", "argentina", "france", "england", "germany", "spain",
+             "portugal", "india", "italy", "netherlands", "belgium"},
 }
 
 
@@ -1314,13 +1464,13 @@ async def _fetch_league_scores(league_code: str, league_name: str, short: str,
 
 
 async def _fetch_all_scores() -> list[dict]:
-    cached = _cache.get("football_scores")
-    if cached:
-        age = time.time() - cached["ts"]
+    cached_entry = _cache.raw_get("football_scores")
+    if cached_entry:
+        age = time.time() - cached_entry["ts"]
         # Use 30m TTL for real data, 5m TTL for empty data (off-season/API down)
-        effective_ttl = 1800 if cached["data"] else 300
+        effective_ttl = 1800 if cached_entry["data"] else 300
         if age < effective_ttl:
-            return cached["data"]
+            return cached_entry["data"]
 
     now = datetime.now(timezone.utc)
     filtered = []
@@ -1363,17 +1513,7 @@ async def _fetch_all_scores() -> list[dict]:
             break
 
     filtered.sort(key=lambda x: x.get("date", ""), reverse=True)
-    # If we couldn't find any matches at all (API failed or extremely long break),
-    # cache the empty list with a much shorter TTL of 5 minutes so we retry sooner.
-    ttl = 1800 if filtered else 300
     _set_cache("football_scores", filtered)
-    
-    # We need to temporarily override the cached value TTL if empty since _cached uses CACHE_TTL by default
-    # But since _cached takes a ttl parameter, _cached("football_scores", ttl=1800 if ... else 300) is clean
-    if not filtered:
-        # Save custom entry with lower TS/TTL or just let it cache with standard entry but read it with dynamic TTL
-        pass
-        
     return filtered
 
 
@@ -1388,7 +1528,7 @@ async def _fetch_hf_daily_papers() -> list[dict]:
             return []
         papers = resp.json()
         items = []
-        for p in papers[:30]:
+        for p in papers[:20]:
             paper    = p.get("paper", {})
             title    = paper.get("title", "")
             abstract = paper.get("summary", "")
@@ -1403,7 +1543,7 @@ async def _fetch_hf_daily_papers() -> list[dict]:
                 "link":        f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else "",
                 "source":      "HF Daily Papers",
                 "published":   pub_date,
-                "description": (abstract[:220] + "...") if len(abstract) > 220 else abstract,
+                "description": (abstract[:157] + "...") if len(abstract) > 160 else abstract,
                 "thumbnail":   thumbnail,
                 "upvotes":     upvotes,
                 "paper_id":    arxiv_id,
@@ -1438,14 +1578,14 @@ async def _fetch_hf_trending_models() -> list[dict]:
 
 
 async def _fetch_trending() -> dict:
-    cached = _cache.get("trending_data")
-    if cached:
-        age = time.time() - cached["ts"]
+    cached_entry = _cache.raw_get("trending_data")
+    if cached_entry:
+        age = time.time() - cached_entry["ts"]
         # Use 1h TTL for real data, 30s TTL for empty/failed data
-        has_data = bool(cached["data"].get("papers") or cached["data"].get("models"))
+        has_data = bool(cached_entry["data"].get("papers") or cached_entry["data"].get("models"))
         effective_ttl = 3600 if has_data else 30
         if age < effective_ttl:
-            return cached["data"]
+            return cached_entry["data"]
 
     papers, models = await asyncio.gather(
         _fetch_hf_daily_papers(),
@@ -1564,8 +1704,27 @@ def _fallback_extract_from_html(html: str) -> str:
 # SSRF protection for image proxy
 # ---------------------------------------------------------------------------
 
+# Known safe image CDN suffixes — skip DNS-based SSRF check for these
+# (corporate split-DNS often resolves CDNs to private IPs, causing false 400s)
+_SAFE_IMG_DOMAINS = (
+    ".espncdn.com", ".espn.com", ".bbci.co.uk", ".bbc.co.uk",
+    ".guim.co.uk", ".guardian.co.uk", ".cloudfront.net",
+    ".akamaized.net", ".akamaihd.net", ".googleapis.com",
+    ".googleusercontent.com", ".gstatic.com", ".ggpht.com",
+    ".twimg.com", ".imgur.com", ".redd.it", ".redditmedia.com",
+    ".wp.com", ".wordpress.com", ".medium.com", ".mktw.net",
+    ".livemint.com", ".ndtvimg.com", ".economictimes.com",
+    ".moneycontrol.com", ".techcrunch.com", ".yahoo.com",
+    ".yimg.com", ".fbcdn.net", ".huggingface.co",
+    ".arxiv.org", ".githubusercontent.com", ".nvidia.com",
+    ".microsoft.com", ".openai.com", ".anthropic.com",
+)
+
+
 def _is_safe_url(url: str) -> bool:
-    """Return True only if the URL is http(s) and resolves to a public IP."""
+    """Return True only if the URL is http(s) and resolves to a public IP.
+    Known image CDN domains skip the DNS check (corporate DNS may resolve them
+    to private IPs via split-DNS)."""
     try:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https"):
@@ -1573,6 +1732,10 @@ def _is_safe_url(url: str) -> bool:
         hostname = parsed.hostname
         if not hostname:
             return False
+        # Allow known CDN domains without DNS lookup
+        hl = hostname.lower()
+        if any(hl.endswith(d) for d in _SAFE_IMG_DOMAINS):
+            return True
         ip_str = socket.gethostbyname(hostname)
         ip = ipaddress.ip_address(ip_str)
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
@@ -1582,30 +1745,15 @@ def _is_safe_url(url: str) -> bool:
         return False
 
 
-def _encode_webp(content: bytes, max_w: int = 400, max_h: int = 300) -> bytes:
-    """Resize image and encode as WebP. CPU-bound — run in executor."""
-    _ensure_pil()
-    import io
-    buf_in  = io.BytesIO(content)
-    img = _PILImage.open(buf_in)
-    img = img.convert("RGB")
-    img.thumbnail((max_w, max_h), _PILImage.Resampling.LANCZOS)
-    buf_out = io.BytesIO()
-    img.save(buf_out, format="WebP", quality=80)
-    return buf_out.getvalue()
-
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.get("/")
 async def index(request: Request):
     return templates.TemplateResponse(request, "index.html")
 
 
-@app.get("/sw.js")
-async def serve_sw():
+async def serve_sw(request: Request):
     """Serve service worker from root so its scope covers the entire app."""
     sw_path = os.path.join(os.path.dirname(__file__), "static", "js", "sw.js")
     try:
@@ -1620,8 +1768,7 @@ async def serve_sw():
     )
 
 
-@app.get("/manifest.json")
-async def serve_manifest():
+async def serve_manifest(request: Request):
     path = os.path.join(os.path.dirname(__file__), "static", "manifest.json")
     try:
         with open(path, encoding="utf-8") as f:
@@ -1631,16 +1778,16 @@ async def serve_manifest():
     return Response(content=content, media_type="application/json")
 
 
-@app.get("/api/news/{category}")
-async def api_news(category: str):
+async def api_news(request: Request):
+    category = request.path_params["category"]
     if category not in RSS_FEEDS:
         return JSONResponse({"error": "Unknown category"}, status_code=400)
-    return JSONResponse(await _fetch_all_feeds(category))
+    return _json_gz_response(await _fetch_all_feeds(category), request)
 
 
-@app.get("/api/news/stream/{category}")
-async def api_news_stream(category: str):
+async def api_news_stream(request: Request):
     """SSE endpoint: emits partial results as feeds arrive, final 'done' event."""
+    category = request.path_params["category"]
     if category not in RSS_FEEDS:
         return JSONResponse({"error": "Unknown category"}, status_code=400)
 
@@ -1686,10 +1833,11 @@ async def api_news_stream(category: str):
                 done_count += 1
 
                 now = time.monotonic()
-                # Emit partial every 4 feeds or every 2 seconds
-                if done_count % 4 == 0 or (now - last_emit) >= 2.0:
+                # Emit partial every 6 feeds or every 3 seconds (reduced frequency)
+                if done_count % 6 == 0 or (now - last_emit) >= 3.0:
                     partial = _process_feeds(list(all_items), category)
                     yield f"data: {json.dumps(partial)}\n\n"
+                    del partial
                     last_emit = now
         finally:
             for t in tasks:
@@ -1699,6 +1847,7 @@ async def api_news_stream(category: str):
         _set_cache(cache_key, final)
         yield f"data: {json.dumps(final)}\n\n"
         yield "event: done\ndata: {}\n\n"
+        del all_items
 
     return StreamingResponse(
         event_gen(),
@@ -1707,31 +1856,29 @@ async def api_news_stream(category: str):
     )
 
 
-@app.get("/api/stocks/all")
-async def api_stocks_all():
+async def api_stocks_all(request: Request):
     results = await asyncio.gather(*[_fetch_stocks(m) for m in STOCK_SYMBOLS])
-    return JSONResponse(dict(zip(STOCK_SYMBOLS.keys(), results)))
+    return _json_gz_response(dict(zip(STOCK_SYMBOLS.keys(), results)), request)
 
 
-@app.get("/api/stocks/{market}")
-async def api_stocks(market: str):
+async def api_stocks(request: Request):
+    market = request.path_params["market"]
     if market not in STOCK_SYMBOLS:
         return JSONResponse({"error": "Unknown market"}, status_code=400)
-    return JSONResponse(await _fetch_stocks(market))
+    return _json_gz_response(await _fetch_stocks(market), request)
 
 
-@app.get("/api/scores")
-async def api_scores():
-    return JSONResponse(await _fetch_all_scores())
+async def api_scores(request: Request):
+    return _json_gz_response(await _fetch_all_scores(), request)
 
 
-@app.get("/api/trending")
-async def api_trending():
-    return JSONResponse(await _fetch_trending())
+async def api_trending(request: Request):
+    return _json_gz_response(await _fetch_trending(), request)
 
 
-@app.get("/api/match/{league}/{event_id}")
-async def api_match(league: str, event_id: str):
+async def api_match(request: Request):
+    league = request.path_params["league"]
+    event_id = request.path_params["event_id"]
     cache_key = f"match_{league}_{event_id}"
     cached = _cached(cache_key, ttl=3600)
     if cached is not None:
@@ -1786,12 +1933,17 @@ async def api_match(league: str, event_id: str):
             continue
         athletes = ke.get("participants", [])
         athlete_name = athletes[0].get("athlete", {}).get("displayName", "") if athletes else ""
-        key_events.append({
+        ev = {
             "type":   etype,
             "clock":  ke.get("clock", {}).get("displayValue", ""),
             "team":   ke.get("team", {}).get("displayName", ""),
             "player": athlete_name,
-        })
+        }
+        # For substitutions, extract both IN (participants[0]) and OUT (participants[1])
+        if etype == "Substitution" and len(athletes) >= 2:
+            ev["playerIn"] = athletes[0].get("athlete", {}).get("displayName", "")
+            ev["playerOut"] = athletes[1].get("athlete", {}).get("displayName", "")
+        key_events.append(ev)
 
     gi    = sdata.get("gameInfo", {})
     venue = gi.get("venue", {})
@@ -1813,9 +1965,8 @@ async def api_match(league: str, event_id: str):
     return JSONResponse(result)
 
 
-@app.get("/api/article")
-async def api_article(url: str = Query(...)):
-    url = url.strip()
+async def api_article(request: Request):
+    url = request.query_params.get("url", "").strip()
     if not url:
         return JSONResponse({"error": "Missing url parameter"}, status_code=400)
 
@@ -1834,7 +1985,12 @@ async def api_article(url: str = Query(...)):
         raw_resp = await _http_client.get(url)
         if raw_resp.status_code in (403, 451):
             return JSONResponse({"error": "blocked", "source_url": url}, status_code=502)
-        raw_html = raw_resp.text
+        # Cap HTML at 512KB to prevent huge pages from blowing up memory
+        raw_bytes = raw_resp.content
+        if len(raw_bytes) > 512 * 1024:
+            raw_bytes = raw_bytes[:512 * 1024]
+        raw_html = raw_bytes.decode(raw_resp.encoding or "utf-8", errors="ignore")
+        del raw_bytes
     except Exception as e:
         return JSONResponse({"error": f"Failed to fetch article: {e}"}, status_code=502)
 
@@ -1853,12 +2009,12 @@ async def api_article(url: str = Query(...)):
         top_image = ld["top_image"]
         text      = ld["text"]
 
-    if len(text) < 100:
+    if len(text) < 100 and _ensure_trafilatura():
         try:
             loop = asyncio.get_event_loop()
 
             def _parse_with_trafilatura():
-                extracted = trafilatura.extract(
+                extracted = _trafilatura.extract(
                     raw_html,
                     url=url,
                     include_comments=False,
@@ -1866,7 +2022,7 @@ async def api_article(url: str = Query(...)):
                     no_fallback=False,
                     favor_precision=True,
                 )
-                meta = trafilatura.extract_metadata(raw_html, default_url=url)
+                meta = _trafilatura.extract_metadata(raw_html, default_url=url)
                 return extracted or "", meta
 
             extracted_text, meta = await loop.run_in_executor(None, _parse_with_trafilatura)
@@ -1888,6 +2044,7 @@ async def api_article(url: str = Query(...)):
         text = _fallback_extract_from_html(raw_html) or text
 
     og = _extract_og_meta(raw_html)
+    del raw_html  # free ~512KB HTML string immediately
     if not title:
         title = og["title"]
     if not top_image:
@@ -1902,6 +2059,11 @@ async def api_article(url: str = Query(...)):
 
     if not text or len(text.strip()) < 50:
         return JSONResponse({"error": "blocked", "source_url": url}, status_code=502)
+
+    # Cap article text at ~10k chars (~2000 words) to bound cache memory
+    _MAX_ARTICLE_CHARS = 10000
+    if len(text) > _MAX_ARTICLE_CHARS:
+        text = text[:_MAX_ARTICLE_CHARS] + "\n\n[Article truncated]"
 
     word_count   = len(text.split())
     reading_time = max(1, math.ceil(word_count / 200))
@@ -1963,17 +2125,32 @@ async def _parse_arxiv_article(url: str, cache_key: str):
         return JSONResponse({"error": f"Failed to parse arXiv article: {e}"}, status_code=502)
 
 
-@app.get("/api/img")
-async def api_img(url: str = Query(...)):
-    """Image proxy: fetch external image, resize, serve as WebP (SSRF-protected)."""
+# Small LRU cache for proxied images — avoids re-fetching same thumbnails
+# Max 20 entries × ~100KB avg = ~2MB peak
+_img_cache: OrderedDict = OrderedDict()
+_IMG_CACHE_MAX = 12
+_IMG_MAX_SIZE = 256 * 1024  # 256KB max per cached image (~3MB peak)
+
+
+async def api_img(request: Request):
+    """Image proxy: fetch external image, pass through (SSRF-protected)."""
+    url = request.query_params.get("url", "")
+    # Check image cache first
+    cached = _img_cache.get(url)
+    if cached:
+        _img_cache.move_to_end(url)
+        return Response(
+            content=cached["data"],
+            media_type=cached["ct"],
+            headers={"Cache-Control": "public, max-age=86400", "X-Cache": "HIT"},
+        )
+
     # SSRF check runs in executor (socket.gethostbyname is blocking)
     loop = asyncio.get_event_loop()
     safe = await loop.run_in_executor(None, lambda: _is_safe_url(url))
     if not safe:
         return Response(status_code=400)
 
-    # Use image-appropriate headers; shared client sends text/html Accept which
-    # causes some CDNs (BBC, etc.) to reject with 403.
     img_headers = {
         "User-Agent": HEADERS["User-Agent"],
         "Accept": "image/webp,image/avif,image/*,*/*;q=0.8",
@@ -1981,9 +2158,6 @@ async def api_img(url: str = Query(...)):
     }
     try:
         resp = await _http_client.get(url, headers=img_headers, timeout=8.0)
-        if resp.status_code in (301, 302, 303, 307, 308):
-            # httpx follows redirects but log for debugging
-            pass
         if resp.status_code != 200:
             return Response(status_code=404)
         content_type = resp.headers.get("content-type", "")
@@ -1991,14 +2165,19 @@ async def api_img(url: str = Query(...)):
             return Response(status_code=404)
 
         raw = resp.content
-        if _ensure_pil():
-            webp = await loop.run_in_executor(None, lambda: _encode_webp(raw))
+        if len(raw) > _IMG_MAX_SIZE:
+            # Too large to cache — pass through without caching
             return Response(
-                content=webp,
-                media_type="image/webp",
+                content=raw,
+                media_type=content_type,
                 headers={"Cache-Control": "public, max-age=86400"},
             )
-        # Pillow not installed: pass through original
+
+        # Cache the image
+        _img_cache[url] = {"data": raw, "ct": content_type}
+        while len(_img_cache) > _IMG_CACHE_MAX:
+            _img_cache.popitem(last=False)
+
         return Response(
             content=raw,
             media_type=content_type,
@@ -2006,6 +2185,33 @@ async def api_img(url: str = Query(...)):
         )
     except Exception:
         return Response(status_code=404)
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+app = Starlette(
+    lifespan=lifespan,
+    routes=[
+        Route("/", index),
+        Route("/sw.js", serve_sw),
+        Route("/manifest.json", serve_manifest),
+        Route("/api/news/stream/{category}", api_news_stream),
+        Route("/api/news/{category}", api_news),
+        Route("/api/stocks/all", api_stocks_all),
+        Route("/api/stocks/{market}", api_stocks),
+        Route("/api/scores", api_scores),
+        Route("/api/trending", api_trending),
+        Route("/api/match/{league}/{event_id}", api_match),
+        Route("/api/article", api_article),
+        Route("/api/img", api_img),
+        Mount("/static", StaticFiles(directory="static"), name="static"),
+    ],
+    middleware=[
+        Middleware(GZipMiddleware, minimum_size=500),
+    ],
+)
 
 
 # ---------------------------------------------------------------------------

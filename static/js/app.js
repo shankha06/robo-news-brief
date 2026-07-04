@@ -174,6 +174,7 @@
 
   // ── News Rendering ────────────────────────────────────────────────────
   let allTopNews = [];
+  let allFootballItems = [];
 
   function heroCard(item) {
     const bm = isBookmarked(item.link) ? " bookmarked" : "";
@@ -271,9 +272,8 @@
   }
 
   function loadFootball() {
-    let footballItems = [];
     return subscribeNews("football", "#footballContainer", (items, c) => {
-      footballItems = items;
+      allFootballItems = items;
       renderNews(c, items, false);
       updateColCount("footballCount", items.length);
     });
@@ -558,6 +558,51 @@
       <div class="skel skel-row"></div>
     </div>`;
 
+    // Timeline helpers
+    function _evCls(t) {
+      if (t === "Goal" || t === "Penalty - Scored") return "tl-goal";
+      if (t === "Own Goal") return "tl-og";
+      if (t === "Yellow Card") return "tl-yellow";
+      if (t === "Red Card") return "tl-red";
+      if (t === "Substitution") return "tl-sub";
+      if (t === "Penalty - Missed") return "tl-miss";
+      return "";
+    }
+
+    /** Group events: merge consecutive subs at same minute+team into one card
+     *  with proper IN/OUT from the API's participants data. */
+    function _groupEvents(events) {
+      const grouped = [];
+      let i = 0;
+      while (i < events.length) {
+        const ev = events[i];
+        if (ev.type === "Substitution") {
+          // Collect ALL consecutive subs at same clock+team
+          const subs = [ev];
+          let j = i + 1;
+          while (j < events.length && events[j].type === "Substitution" &&
+                 events[j].clock === ev.clock && events[j].team === ev.team) {
+            subs.push(events[j]);
+            j++;
+          }
+          grouped.push({
+            type: "SubGroup",
+            clock: ev.clock,
+            team: ev.team,
+            subs: subs.map(s => ({
+              playerIn: s.playerIn || s.player,
+              playerOut: s.playerOut || "",
+            })),
+          });
+          i = j;
+        } else {
+          grouped.push(ev);
+          i++;
+        }
+      }
+      return grouped;
+    }
+
     fetch(`/api/match/${leagueCode}/${eventId}`)
       .then((r) => r.json())
       .then((data) => {
@@ -568,60 +613,119 @@
         const home = data.teams.find((t) => t.home_away === "home") || data.teams[0] || {};
         const away = data.teams.find((t) => t.home_away === "away") || data.teams[1] || {};
 
-        let html = `<div class="match-header">
-          <div class="match-team-col">
-            ${home.logo ? `<img class="match-team-logo" src="${home.logo}" alt="">` : ""}
-            <span class="match-team-name">${home.name}</span>
+        // \u2500\u2500 Scoreboard header \u2500\u2500
+        let html = `<div class="ms-scoreboard">
+          <div class="ms-team">
+            ${home.logo ? `<img class="ms-team-logo" src="${home.logo}" alt="" onerror="this.style.display='none'">` : ""}
+            <span class="ms-team-name">${home.name}</span>
           </div>
-          <div class="match-score-col">
-            <span class="match-score-big">${home.score} - ${away.score}</span>
+          <div class="ms-score-center">
+            <span class="ms-score">${home.score}</span>
+            <span class="ms-score-sep">\u2013</span>
+            <span class="ms-score">${away.score}</span>
+            <span class="ms-ft-badge">FT</span>
           </div>
-          <div class="match-team-col">
-            ${away.logo ? `<img class="match-team-logo" src="${away.logo}" alt="">` : ""}
-            <span class="match-team-name">${away.name}</span>
+          <div class="ms-team">
+            ${away.logo ? `<img class="ms-team-logo" src="${away.logo}" alt="" onerror="this.style.display='none'">` : ""}
+            <span class="ms-team-name">${away.name}</span>
           </div>
         </div>`;
 
+        // \u2500\u2500 Match info bar \u2500\u2500
         let infoParts = [];
         if (data.date) {
           const d = new Date(data.date);
-          const dateStr = d.toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "short", year: "numeric" });
-          const timeStr = d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: false });
-          infoParts.push(`<span>${dateStr} &middot; ${timeStr}</span>`);
+          const dateStr = d.toLocaleDateString("en-US", { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+          const timeStr = d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true });
+          infoParts.push(`<span class="ms-info-chip">\uD83D\uDCC5 ${dateStr}, ${timeStr}</span>`);
         }
-        let venueParts = [];
-        if (data.venue) venueParts.push(data.venue);
-        if (data.location) venueParts.push(data.location);
-        if (venueParts.length) infoParts.push(`<span>${venueParts.join(", ")}</span>`);
-        if (data.attendance) infoParts.push(`<span>Attendance: ${Number(data.attendance).toLocaleString()}</span>`);
-
+        if (data.venue || data.location) {
+          const loc = [data.venue, data.location].filter(Boolean).join(", ");
+          infoParts.push(`<span class="ms-info-chip">\uD83D\uDCCD ${loc}</span>`);
+        }
+        if (data.attendance) {
+          infoParts.push(`<span class="ms-info-chip">\uD83D\uDC65 ${Number(data.attendance).toLocaleString()}</span>`);
+        }
         if (infoParts.length) {
-          html += `<div class="match-venue" style="flex-direction:column; gap:4px">${infoParts.join("")}</div>`;
+          html += `<div class="ms-info-bar">${infoParts.join("")}</div>`;
         }
 
+        // \u2500\u2500 Key events: vertical center-axis timeline \u2500\u2500
         if (data.events.length) {
-          html += `<div class="match-events">`;
-          for (const ev of data.events) {
-            let icon = "";
-            if (ev.type === "Goal" || ev.type === "Penalty - Scored") icon = "\u26BD";
-            else if (ev.type === "Own Goal")    icon = "\u26BD\u200B(OG)";
-            else if (ev.type === "Yellow Card") icon = "\uD83D\uDFE8";
-            else if (ev.type === "Red Card")    icon = "\uD83D\uDFE5";
-            else if (ev.type === "Substitution") icon = "\uD83D\uDD04";
-            else if (ev.type === "Penalty - Missed") icon = "\u274C";
-            html += `<div class="match-event ${ev.team === home.name ? "ev-home" : "ev-away"}">
-              <span class="ev-clock">${ev.clock}</span>
-              <span class="ev-icon">${icon}</span>
-              <span class="ev-player">${ev.player}</span>
-            </div>`;
+          // Goal scorers summary bar
+          const goals = data.events.filter(e => e.type === "Goal" || e.type === "Penalty - Scored" || e.type === "Own Goal");
+          const homeGoals = goals.filter(g => g.team === home.name);
+          const awayGoals = goals.filter(g => g.team === away.name);
+          if (goals.length) {
+            html += `<div class="ms-goal-summary">`;
+            html += `<div class="ms-goal-side ms-goal-home">${homeGoals.map(g => `<span>${g.player} ${g.clock}'${g.type === "Own Goal" ? " (OG)" : g.type === "Penalty - Scored" ? " (P)" : ""}</span>`).join("") || "&nbsp;"}</div>`;
+            html += `<div class="ms-goal-icon">\u26BD</div>`;
+            html += `<div class="ms-goal-side ms-goal-away">${awayGoals.map(g => `<span>${g.player} ${g.clock}'${g.type === "Own Goal" ? " (OG)" : g.type === "Penalty - Scored" ? " (P)" : ""}</span>`).join("") || "&nbsp;"}</div>`;
+            html += `</div>`;
+          }
+
+          // Group events (pair consecutive subs)
+          const grouped = _groupEvents(data.events);
+
+          html += `<div class="ms-section-title">Match Timeline</div>`;
+          html += `<div class="tl">`;
+
+          // Half-time marker injection
+          let htInserted = false;
+
+          for (const ev of grouped) {
+            const min = parseInt(ev.clock) || 0;
+            // Insert HT marker before first event >= 46'
+            if (!htInserted && min >= 46) {
+              html += `<div class="tl-half"><span>HT</span></div>`;
+              htInserted = true;
+            }
+
+            const isHome = ev.team === home.name;
+            const side = isHome ? "tl-left" : "tl-right";
+
+            if (ev.type === "SubGroup") {
+              // Grouped substitutions with IN/OUT
+              const rows = ev.subs.map(s => {
+                const out = s.playerOut ? `<span class="tl-sub-out">\u25BC ${s.playerOut}</span>` : "";
+                return `<div class="tl-sub-row">
+                  <span class="tl-sub-in">\u25B2 ${s.playerIn}</span>${out}
+                </div>`;
+              }).join("");
+              html += `<div class="tl-row ${side} tl-sub">
+                <div class="tl-content">
+                  <div class="tl-sub-group">${rows}</div>
+                </div>
+                <div class="tl-center"><span class="tl-dot">\u21C4</span><span class="tl-min">${ev.clock}'</span></div>
+              </div>`;
+            } else {
+              // Regular event
+              const cls = _evCls(ev.type);
+              let icon = "";
+              if (ev.type === "Goal" || ev.type === "Penalty - Scored") icon = "\u26BD";
+              else if (ev.type === "Own Goal") icon = "\u26BD";
+              else if (ev.type === "Yellow Card") icon = `<span class="tl-card-icon tl-card-y"></span>`;
+              else if (ev.type === "Red Card") icon = `<span class="tl-card-icon tl-card-r"></span>`;
+              else if (ev.type === "Penalty - Missed") icon = "\u2715";
+
+              const extra = ev.type === "Own Goal" ? " (OG)" : ev.type === "Penalty - Scored" ? " (P)" : ev.type === "Penalty - Missed" ? " (missed)" : "";
+              html += `<div class="tl-row ${side} ${cls}">
+                <div class="tl-content">
+                  <span class="tl-player">${ev.player}${extra}</span>
+                </div>
+                <div class="tl-center"><span class="tl-dot">${icon}</span><span class="tl-min">${ev.clock}'</span></div>
+              </div>`;
+            }
           }
           html += `</div>`;
         }
 
+        // \u2500\u2500 Stats comparison \u2500\u2500
         if (data.stats.length >= 2) {
           const hs = data.stats[0].stats;
           const as_ = data.stats[1].stats;
-          html += `<div class="match-stats-grid">`;
+          html += `<div class="ms-section-title">Match Statistics</div>`;
+          html += `<div class="ms-stats">`;
           for (const key of Object.keys(hs)) {
             const hv = hs[key], av = as_[key];
             if (hv === "-" && av === "-") continue;
@@ -630,14 +734,19 @@
             const total = hn + an || 1;
             const hPct = (hn / total) * 100;
             const isPoss = key === "Possession";
-            html += `<div class="stat-row">
-              <span class="stat-label">${key}</span>
-              <span class="stat-val-l">${isPoss ? hv + "%" : hv}</span>
-              <div class="stat-bar-wrap">
-                <div class="stat-bar-home" style="width:${hPct}%"></div>
-                <div class="stat-bar-away" style="width:${100 - hPct}%"></div>
+            const hDisplay = isPoss ? hv + "%" : hv;
+            const aDisplay = isPoss ? av + "%" : av;
+            const hWins = hn > an, aWins = an > hn;
+            html += `<div class="ms-stat">
+              <div class="ms-stat-val ${hWins ? "ms-stat-win" : ""}">${hDisplay}</div>
+              <div class="ms-stat-center">
+                <div class="ms-stat-label">${key}</div>
+                <div class="ms-stat-bars">
+                  <div class="ms-bar-home" style="width:${hPct}%"></div>
+                  <div class="ms-bar-away" style="width:${100 - hPct}%"></div>
+                </div>
               </div>
-              <span class="stat-val-r">${isPoss ? av + "%" : av}</span>
+              <div class="ms-stat-val ${aWins ? "ms-stat-win" : ""}">${aDisplay}</div>
             </div>`;
           }
           html += `</div>`;
@@ -680,7 +789,7 @@
   }
 
   document.addEventListener("keydown", (e) => {
-    if (e.target.matches("input, textarea, select")) {
+    if (e.target && e.target.matches && e.target.matches("input, textarea, select")) {
       if (e.key === "Escape") e.target.blur();
       return;
     }
@@ -774,7 +883,7 @@
   // No setInterval — SSE eliminates the need for scheduled polling.
   // Columns resize on window change.
   window.addEventListener("resize", () => {
-    adjustColumns(allTopNews.length, 0, allAiItems.length);
+    adjustColumns(allTopNews.length, allFootballItems.length, allAiItems.length);
   });
 
 })();

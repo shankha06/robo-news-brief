@@ -1,22 +1,21 @@
 [project]
 name = "brief-news"
-version = "3.0.0"
-description = "Automated news aggregation and briefing system that collects financial and general news from multiple sources, processes RSS feeds, and delivers curated summaries"
+version = "4.0.0"
+description = "Lightweight news, stocks & football aggregator — Starlette + stdlib XML, optimized for low-RAM servers"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.115.0",
+    "starlette>=0.45.0",
     "jinja2>=3.1.0",
     "uvicorn[standard]>=0.34.0",
     "gunicorn>=23.0.0",
     "httpx>=0.28.0",
-    "feedparser>=6.0.12",
-    "googlenewsdecoder>=0.1.7",
-    "lxml>=6.0.2",
-    "lxml-html-clean>=0.4.4",
-    "newspaper4k>=0.9.4.1",
-    "pillow>=11.0.0",
-    "yfinance>=1.2.0",
     "python-multipart>=0.0.20",
     "truststore>=0.9",
-    "trafilatura>=2.0.0",
+]
+
+[project.optional-dependencies]
+# Install these only if you have RAM to spare
+extras = [
+    "trafilatura>=2.0.0",         # better article extraction (~30MB)
+    "googlenewsdecoder>=0.1.7",   # resolve Google News redirect URLs (~5MB)
 ]
