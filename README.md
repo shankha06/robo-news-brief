@@ -41,6 +41,19 @@ Most people start their day cycling through a dozen bookmarks — news sites, ma
 > [!NOTE]
 > **Zero API keys required.** Every data source is free and public — RSS feeds, Yahoo Finance, ESPN endpoints. Clone, run, done.
 
+### Research Discovery and Resource Limits
+
+- Scans up to 1,000 entries per research feed, retaining only the best 40 candidates and up to 1,200 characters of each abstract. Includes arXiv CS.IR for retrieval, embeddings, and ranking research.
+- Ranks by topic relevance, technical evidence, bounded Hugging Face votes, independent-source coverage, and freshness. It does not infer scientific impact from citation counts or use an LLM to judge papers.
+- Merges arXiv paper versions with Hugging Face picks without losing votes or abstracts. Limits any single source so papers and technical blogs can both surface.
+- Uses verified publisher feeds and site-restricted Google News discovery for Anthropic, Mistral, and Meta, whose configured publisher feeds were unavailable. Those fallback items can have shorter descriptions and Google redirect links.
+- Shares one refresh per category across JSON and streaming clients. All RSS requests use a six-fetch limit, a 4 MiB decompressed response cap, conditional HTTP requests, and bounded caches. Streaming clients receive partial results; slow clients retain only the latest update.
+- Caches research for five hours, other news for 15 minutes, and successful Hugging Face paper requests for one hour. Empty category results retry after 30 seconds; refreshes have a 30-second budget.
+
+Run the focused regression suite with `uv run python -m unittest discover -s tests -v`.
+
+Local synthetic measurements: ranking 1,000 candidates took 99 ms versus 291 ms before. With three simultaneous streaming clients and 12 feeds of 300 entries each, peak traced Python allocations fell from 27.7 MiB to 6.9 MiB, and upstream requests fell from 36 to 12. These are controlled workload measurements, not production RSS or latency guarantees. Live relevance still depends on source availability and the quality of publisher metadata.
+
 <br>
 
 <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->

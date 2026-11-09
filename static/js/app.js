@@ -191,12 +191,12 @@
 
   function heroCard(item) {
     const bm = isBookmarked(item.link) ? " bookmarked" : "";
-    return `<a href="${item.link}" target="_blank" rel="noopener" class="news-hero${bm}" data-url="${item.link}">
+    return `<a href="${escapeHtml(item.link)}" target="_blank" rel="noopener" class="news-hero${bm}" data-url="${escapeHtml(item.link)}">
       <span class="hero-tag news-tag ${tagClass(item.tag)}">${item.tag}</span>
-      <h3 class="hero-title">${item.title}</h3>
-      <p class="hero-desc">${item.description || ""}</p>
+      <h3 class="hero-title">${escapeHtml(item.title)}</h3>
+      <p class="hero-desc">${escapeHtml(item.description || "")}</p>
       <div class="hero-meta">
-        <span class="hero-source">${item.source}</span>
+        <span class="hero-source">${escapeHtml(item.source)}</span>
         <span class="hero-time">${timeAgo(item.published)}</span>
       </div>
     </a>`;
@@ -207,15 +207,15 @@
       ? `<img class="news-row-thumb" src="${proxyImg(item.thumbnail)}" alt="" loading="lazy" onerror="this.style.display='none'">`
       : "";
     const bm = isBookmarked(item.link) ? " bookmarked" : "";
-    return `<a href="${item.link}" target="_blank" rel="noopener" class="news-row${bm}" data-url="${item.link}">
+    return `<a href="${escapeHtml(item.link)}" target="_blank" rel="noopener" class="news-row${bm}" data-url="${escapeHtml(item.link)}">
       ${thumb}
       <div class="news-row-body">
         <div class="news-row-head">
           <span class="news-tag ${tagClass(item.tag)}">${item.tag}</span>
         </div>
-        <div class="news-row-title">${item.title}</div>
+        <div class="news-row-title">${escapeHtml(item.title)}</div>
         <div class="news-row-meta">
-          <span class="news-row-source">${item.source}</span>
+          <span class="news-row-source">${escapeHtml(item.source)}</span>
           <span class="news-row-time">${timeAgo(item.published)}</span>
         </div>
       </div>
@@ -315,14 +315,14 @@
   function aiCard(item) {
     const bm = isBookmarked(item.link) ? " bookmarked" : "";
     const upvotes = item.upvotes ? `<span class="ai-upvotes" title="HuggingFace upvotes">${item.upvotes}</span>` : "";
-    return `<a href="${item.link}" target="_blank" rel="noopener" class="ai-card${bm}" data-url="${item.link}">
+    return `<a href="${escapeHtml(item.link)}" target="_blank" rel="noopener" class="ai-card${bm}" data-url="${escapeHtml(item.link)}">
       <div class="ai-card-head">
         <span class="news-tag ${tagClass(item.tag)}">${item.tag}</span>
-        <span class="ai-card-source">${item.source}</span>
+        <span class="ai-card-source">${escapeHtml(item.source)}</span>
         ${upvotes}
       </div>
-      <div class="ai-card-title">${item.title}</div>
-      <div class="ai-card-desc">${item.description || ""}</div>
+      <div class="ai-card-title">${escapeHtml(item.title)}</div>
+      <div class="ai-card-desc">${escapeHtml(item.description || "")}</div>
       <div class="ai-card-meta">
         <span>${timeAgo(item.published)}</span>
       </div>

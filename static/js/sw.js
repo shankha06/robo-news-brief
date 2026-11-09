@@ -1,5 +1,5 @@
 /* The Brief — Service Worker v1 */
-const CACHE = "brief-v8";
+const CACHE = "brief-v9";
 const STATIC = ["/", "/static/css/style.css", "/static/js/app.js"];
 
 self.addEventListener("install", (e) => {

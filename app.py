@@ -2,9 +2,11 @@
 """The Brief — Personal news, stocks & search aggregator (Starlette edition)."""
 
 import asyncio
-import gc
 import gzip as _gzip
+import heapq
+import html
 import ipaddress
+import io
 import json
 import math
 import os
@@ -15,6 +17,7 @@ import urllib.parse
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 # Use OS trust store (macOS Keychain / Linux ca-certificates) so corporate SSL
 # proxy certificates are trusted without disabling verification entirely.
@@ -75,6 +78,10 @@ async def lifespan(app):
         follow_redirects=True,
     )
     yield
+    pending = list(_inflight.values())
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
     await _http_client.aclose()
 
 
@@ -110,28 +117,28 @@ RSS_FEEDS = {
         ("Google Transfer News", "https://news.google.com/rss/search?q=football+transfer+news+2026&hl=en-IN&gl=IN&ceid=IN:en"),
     ],
     "ai_research": [
-        # Consolidated arXiv: keep top 4 (CL, AI, LG, CV); drop IR, RO, MA, stat.ML
         ("arXiv CS.CL", "https://rss.arxiv.org/rss/cs.CL"),
         ("arXiv CS.AI", "https://rss.arxiv.org/rss/cs.AI"),
         ("arXiv CS.LG", "https://rss.arxiv.org/rss/cs.LG"),
         ("arXiv CS.CV", "https://rss.arxiv.org/rss/cs.CV"),
+        ("arXiv CS.IR", "https://rss.arxiv.org/rss/cs.IR"),
         # Lab blogs (high-signal, infrequent)
-        ("OpenAI", "https://openai.com/blog/rss.xml"),
-        ("Anthropic", "https://www.anthropic.com/rss/research.rss"),
+        ("OpenAI", "https://openai.com/news/rss.xml"),
+        ("Anthropic", "https://news.google.com/rss/search?q=site:anthropic.com+research+OR+engineering&hl=en-US&gl=US&ceid=US:en"),
         ("Google AI", "https://blog.research.google/feeds/posts/default?alt=rss"),
         ("DeepMind", "https://deepmind.google/blog/rss.xml"),
-        ("Mistral", "https://mistral.ai/blog-rss.xml"),
-        ("Nvidia AI", "https://blogs.nvidia.com/feed/"),
+        ("Mistral", "https://news.google.com/rss/search?q=site:mistral.ai/news&hl=en-US&gl=US&ceid=US:en"),
+        ("Nvidia AI", "https://developer.nvidia.com/blog/feed/"),
         ("Microsoft Research", "https://www.microsoft.com/en-us/research/blog/feed/"),
-        ("Meta AI", "https://research.facebook.com/feed/"),
+        ("Meta AI", "https://news.google.com/rss/search?q=site:ai.meta.com/blog&hl=en-US&gl=US&ceid=US:en"),
         ("Apple ML", "https://machinelearning.apple.com/rss.xml"),
         ("Amazon Science", "https://www.amazon.science/index.rss"),
         ("HuggingFace", "https://huggingface.co/blog/feed.xml"),
         # Curated newsletters/blogs (high signal-to-noise)
         ("Lil'Log", "https://lilianweng.github.io/index.xml"),
-        ("The Batch", "https://www.deeplearning.ai/the-batch/feed/"),
+        ("Sebastian Raschka", "https://magazine.sebastianraschka.com/feed"),
         ("Import AI", "https://importai.substack.com/feed"),
-        ("Simon Willison", "https://simonwillison.net/atom/everything/"),
+        ("Simon Willison", "https://simonwillison.net/atom/entries/"),
         # Community (cap items heavily)
         ("r/MachineLearning", "https://www.reddit.com/r/MachineLearning/.rss"),
         ("r/LocalLLaMA", "https://www.reddit.com/r/LocalLLaMA/.rss"),
@@ -201,7 +208,7 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
 }
 
 CACHE_TTL = 900        # 15 min — top_news, football, stocks
@@ -270,10 +277,11 @@ def _json_gz_response(data, request=None) -> Response:
         cached_gz = _gz_cache.get(data_id)
         if cached_gz:
             _gz_cache.move_to_end(data_id)
+            cached_gz = cached_gz[1]
         else:
             raw = json.dumps(data, separators=(",", ":")).encode()
             cached_gz = _gzip.compress(raw, compresslevel=4)
-            _gz_cache[data_id] = cached_gz
+            _gz_cache[data_id] = (data, cached_gz)
             while len(_gz_cache) > _GZ_CACHE_MAX:
                 _gz_cache.popitem(last=False)
         return Response(
@@ -323,10 +331,11 @@ _cb = CircuitBreaker()
 # Per-feed HTTP conditional-request cache: url → {etag, last_modified}
 # Bounded: only keeps headers for active feeds (~50 entries, tiny)
 _feed_http_cache: OrderedDict[str, dict] = OrderedDict()
-_FEED_HTTP_CACHE_MAX = 30
+_FEED_HTTP_CACHE_MAX = 64
 # Per-feed stale items (served on 304 or circuit-open) — bounded
 _feed_items_cache: OrderedDict[str, list] = OrderedDict()
-_FEED_ITEMS_CACHE_MAX = 30
+_FEED_ITEMS_CACHE_MAX = 64
+_FEED_MAX_BYTES = 4 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Scoring constants (unchanged from v1)
@@ -513,10 +522,10 @@ AI_SOURCE_TIERS = {
     "Google AI": 7.0, "Meta AI": 7.0, "Mistral": 6.0, "Nvidia AI": 6.0,
     "Microsoft Research": 6.0, "Apple ML": 6.5, "Amazon Science": 5.5,
     "Lil'Log": 6.0, "HuggingFace": 5.0,
-    "The Batch": 5.0, "Import AI": 5.0,
+    "Sebastian Raschka": 6.0, "Import AI": 5.0,
     "Simon Willison": 4.5,
     "arXiv CS.CL": 2.0, "arXiv CS.AI": 2.0, "arXiv CS.LG": 2.0,
-    "arXiv CS.CV": 2.0,
+    "arXiv CS.CV": 2.0, "arXiv CS.IR": 2.0,
     "r/MachineLearning": 2.5, "r/LocalLLaMA": 2.0, "HN AI": 2.5,
     "Google AI News": 1.5,
     "HF Daily Papers": 7.0,
@@ -752,6 +761,19 @@ def _score_football_article(item: dict) -> float:
     return max(importance, 0.0) * recency_mult + source_boost
 
 
+_AI_TOPIC_PATTERNS = tuple(
+    (tag, re.compile(r"(?<!\w)(?:" + "|".join(
+        re.escape(keyword) + r"s?" for keyword in keywords
+    ) + r")(?!\w)", re.IGNORECASE))
+    for tag, keywords in AI_CATEGORY_TAGS.items()
+)
+_AI_EVIDENCE_RE = re.compile(
+    r"\b(?:benchmark|ablation|evaluation|dataset|implementation|code|weights|"
+    r"latency|throughput|memory|reproducib\w*|experiment\w*|open[- ]source)\b",
+    re.IGNORECASE,
+)
+
+
 def _score_ai_article(item: dict) -> float:
     title  = item.get("title", "").lower()
     desc   = item.get("description", "").lower()
@@ -759,31 +781,22 @@ def _score_ai_article(item: dict) -> float:
     source = item.get("source", "")
     importance = 0.0
 
-    kw_importance = 0.0
-    for kw, weight in AI_HIGH_IMPACT_KEYWORDS.items():
-        if kw in title:
-            kw_importance += weight * 3.0
-        elif kw in desc:
-            kw_importance += weight * 0.8
-    importance += min(kw_importance, 12.0)
-
-    if _AI_SOTA_RE.search(title):
-        importance += 8.0
-    elif _AI_SOTA_RE.search(desc):
+    for _, pattern in _AI_TOPIC_PATTERNS:
+        if pattern.search(title):
+            importance += 5.0
+        elif pattern.search(desc):
+            importance += 2.0
+    importance = min(importance, 18.0)
+    evidence = len(set(match.group().lower() for match in _AI_EVIDENCE_RE.finditer(title + " " + desc)))
+    importance += min(evidence * 1.5, 6.0)
+    if source.startswith("arXiv") or source == "HF Daily Papers":
         importance += 3.0
-
-    if _AI_NOVEL_RE.search(title):
-        importance += 5.0
-
-    is_arxiv = source.startswith("arXiv")
-    has_signal = _AI_SOTA_RE.search(title) or _AI_NOVEL_RE.search(title)
-    if is_arxiv and not has_signal:
-        importance -= 6.0
+    if _AI_NOVEL_RE.search(title + " " + desc):
+        importance += 2.0
+    importance += min(math.log2(max(item.get("upvotes", 0), 0) + 1), 5.0)
 
     if _AI_NOISE_RE.search(title):
         importance -= 15.0
-    if _SOFT_NEWS_RE.search(title):
-        importance -= 10.0
 
     age_h = None
     if pub:
@@ -792,12 +805,12 @@ def _score_ai_article(item: dict) -> float:
         except Exception:
             pass
     if age_h is None:
-        recency_mult = 0.5
+        recency_mult = 0.7
     else:
-        recency_mult = max(2.0 * math.exp(-0.0145 * max(age_h, 0)), 0.1)
+        recency_mult = math.exp(-math.log(2) * max(age_h, 0) / 168)
 
     source_boost = AI_SOURCE_TIERS.get(item.get("source", ""), 1.5)
-    return max(importance, 0.0) * recency_mult + source_boost
+    return (max(importance, 0.0) + source_boost) * recency_mult
 
 
 def _tag_article(item: dict) -> str:
@@ -817,10 +830,11 @@ def _tag_article(item: dict) -> str:
 
 
 def _tag_ai_article(item: dict) -> str:
-    text = (item.get("title", "") + " " + item.get("description", "")).lower()
+    title = item.get("title", "")
+    desc = item.get("description", "")
     best_tag, best_count = "", 0
-    for tag, keywords in AI_CATEGORY_TAGS.items():
-        count = sum(1 for kw in keywords if kw in text)
+    for tag, pattern in _AI_TOPIC_PATTERNS:
+        count = len(pattern.findall(title)) * 3 + len(pattern.findall(desc))
         if count > best_count:
             best_count, best_tag = count, tag
     return best_tag or "ML"
@@ -855,106 +869,108 @@ async def _fetch_feed(source_name: str, url: str) -> list[dict]:
         return _feed_items_cache.get(url, [])
 
     req_headers: dict[str, str] = {}
-    cached_hdrs = _feed_http_cache.get(url, {})
+    cached_hdrs = _feed_http_cache.get(url, {}) if url in _feed_items_cache else {}
     if cached_hdrs.get("etag"):
         req_headers["If-None-Match"] = cached_hdrs["etag"]
     if cached_hdrs.get("last_modified"):
         req_headers["If-Modified-Since"] = cached_hdrs["last_modified"]
 
     try:
-        resp = await _http_client.get(url, headers=req_headers)
-
-        if resp.status_code == 304:
-            _cb.record_success(url)
-            return _feed_items_cache.get(url, [])
-
-        resp.raise_for_status()
-        _cb.record_success(url)
-
-        # Store conditional-request headers for next call
-        new_hdrs: dict[str, str] = {}
-        if resp.headers.get("etag"):
-            new_hdrs["etag"] = resp.headers["etag"]
-        if resp.headers.get("last-modified"):
-            new_hdrs["last_modified"] = resp.headers["last-modified"]
-        if new_hdrs:
-            _feed_http_cache[url] = new_hdrs
-            if len(_feed_http_cache) > _FEED_HTTP_CACHE_MAX:
-                _feed_http_cache.popitem(last=False)
-
-        content = resp.content
+        async with _http_client.stream("GET", url, headers=req_headers) as resp:
+            if resp.status_code == 304:
+                _cb.record_success(url)
+                return _feed_items_cache.get(url, [])
+            resp.raise_for_status()
+            content = bytearray()
+            async for chunk in resp.aiter_bytes(chunk_size=65536):
+                content.extend(chunk)
+                if len(content) > _FEED_MAX_BYTES:
+                    raise ValueError("Feed exceeds decompressed size limit")
+            new_hdrs = {
+                key: resp.headers[header]
+                for key, header in (("etag", "etag"), ("last_modified", "last-modified"))
+                if header in resp.headers
+            }
+        items = await asyncio.to_thread(_parse_feed, source_name, content)
     except Exception:
         _cb.record_failure(url)
         return _feed_items_cache.get(url, [])
 
-    # Parse RSS/Atom with stdlib xml.etree — zero extra deps, ~8MB saved
-    loop = asyncio.get_event_loop()
-    try:
-        root = await loop.run_in_executor(None, lambda: ET.fromstring(content))
-    except Exception:
-        return _feed_items_cache.get(url, [])
-    del content  # free raw RSS bytes
+    _cb.record_success(url)
+    gn_indices = [index for index, item in enumerate(items) if "news.google.com" in item["link"]]
+    if gn_indices and _gnd_decoder is not None:
+        resolved = await asyncio.gather(
+            *[_resolve_google_news_url(items[index]["link"]) for index in gn_indices],
+            return_exceptions=True,
+        )
+        for index, result in zip(gn_indices, resolved):
+            if isinstance(result, str):
+                items[index]["link"] = result
 
-    # Detect Atom vs RSS and extract namespace
-    ns = {}
-    tag = root.tag
-    if "}" in tag:
-        atom_ns = tag.split("}")[0] + "}"
-        ns["a"] = atom_ns.strip("{}")
-    media_ns = {"media": "http://search.yahoo.com/mrss/"}
+    _feed_http_cache[url] = new_hdrs
+    while len(_feed_http_cache) > _FEED_HTTP_CACHE_MAX:
+        _feed_http_cache.popitem(last=False)
+    _feed_items_cache[url] = items
+    while len(_feed_items_cache) > _FEED_ITEMS_CACHE_MAX:
+        _feed_items_cache.popitem(last=False)
+    return items
 
-    # Find entries: RSS <item> or Atom <entry>
-    entries = root.findall(".//item")
-    if not entries:
-        entries = root.findall(f".//{{{ns.get('a', '')}}}entry") if ns.get("a") else root.findall(".//entry")
 
+_STRIP_TAGS_RE = re.compile(r"<[^>]+>")
+_ARXIV_BOILERPLATE_RE = re.compile(r"^arXiv:.*?Abstract:\s*", re.DOTALL)
+
+
+def _parse_feed(source_name: str, content: bytes | bytearray) -> list[dict]:
+    is_ai = source_name in AI_SOURCE_TIERS
     items = []
-    gn_indices = []
-    _strip_tags_re = re.compile(r"<[^>]+>")
+    candidates = []
+    scanned = 0
+    for _, entry in ET.iterparse(io.BytesIO(content), events=("end",)):
+        if entry.tag.rsplit("}", 1)[-1] not in {"item", "entry"}:
+            continue
+        namespace = entry.tag.rsplit("}", 1)[0] + "}" if "}" in entry.tag else ""
 
-    for entry in entries[:8]:
         def _txt(tag_name: str) -> str:
-            """Get text from a child element, trying plain and namespaced."""
             el = entry.find(tag_name)
-            if el is None and ns.get("a"):
-                el = entry.find(f"{{{ns['a']}}}{tag_name}")
-            return (el.text or "").strip() if el is not None else ""
+            if el is None and namespace:
+                el = entry.find(namespace + tag_name)
+            return "".join(el.itertext()).strip() if el is not None else ""
 
-        title = _txt("title")
-        # Link: RSS uses <link>text</link>, Atom uses <link href="..."/>
+        title = html.unescape(_txt("title"))
         link = _txt("link")
         if not link:
-            link_el = entry.find(f"{{{ns.get('a', '')}}}link") if ns.get("a") else entry.find("link")
-            if link_el is not None:
-                link = link_el.get("href", "") or (link_el.text or "")
+            for link_el in entry.findall(namespace + "link"):
+                if link_el.get("rel", "alternate") == "alternate":
+                    link = link_el.get("href", "")
+                    break
 
-        # Published date
-        pub_text = _txt("pubDate") or _txt("published") or _txt("updated") or _txt("dc:date")
+        pub_text = (_txt("pubDate") or _txt("published") or _txt("updated")
+                    or _txt("{http://purl.org/dc/elements/1.1/}date"))
         published = ""
         if pub_text:
-            for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z",
-                        "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
-                        "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%d"):
+            try:
                 try:
-                    published = datetime.strptime(pub_text.strip(), fmt).astimezone(timezone.utc).isoformat()
-                    break
+                    date = datetime.fromisoformat(pub_text)
                 except ValueError:
-                    continue
+                    date = parsedate_to_datetime(pub_text)
+                published = date.replace(tzinfo=date.tzinfo or timezone.utc).astimezone(timezone.utc).isoformat()
+            except (ValueError, TypeError, OverflowError):
+                pass
 
-        # Description
         desc = _txt("description") or _txt("summary") or _txt("content")
-        desc = _strip_tags_re.sub("", desc).strip()
-        if len(desc) > 160:
-            desc = desc[:157] + "..."
+        desc = html.unescape(_STRIP_TAGS_RE.sub("", desc)).strip()
+        desc = _ARXIV_BOILERPLATE_RE.sub("", desc)
+        limit = 1200 if is_ai else 320
+        if len(desc) > limit:
+            desc = desc[:limit - 3] + "..."
 
-        # Thumbnail: media:thumbnail, media:content, enclosure
         thumb = ""
-        for mt in entry.findall(f"{{{media_ns['media']}}}thumbnail"):
+        for mt in entry.findall("{http://search.yahoo.com/mrss/}thumbnail"):
             thumb = mt.get("url", "")
             if thumb:
                 break
         if not thumb:
-            for mc in entry.findall(f"{{{media_ns['media']}}}content"):
+            for mc in entry.findall("{http://search.yahoo.com/mrss/}content"):
                 mc_url = mc.get("url", "")
                 if "image" in mc.get("type", "") or mc_url.endswith((".jpg", ".png", ".webp")):
                     thumb = mc_url
@@ -967,87 +983,112 @@ async def _fetch_feed(source_name: str, url: str) -> list[dict]:
         desc_words = len(desc.split())
         estimated_wc = max(200, desc_words * 20)
         reading_time = max(1, math.ceil(estimated_wc / 200))
-        idx = len(items)
-        items.append({
-            "title": title,
-            "link": link,
-            "source": source_name,
-            "published": published,
-            "description": desc,
-            "thumbnail": thumb,
-            "readingTime": reading_time,
-        })
-        if "news.google.com" in link:
-            gn_indices.append(idx)
-
-    del root  # free XML tree
-
-    if gn_indices:
-        resolved = await asyncio.gather(
-            *[_resolve_google_news_url(items[i]["link"]) for i in gn_indices],
-            return_exceptions=True,
-        )
-        for i, r in zip(gn_indices, resolved):
-            if isinstance(r, str):
-                items[i]["link"] = r
-
-    _feed_items_cache[url] = items
-    if len(_feed_items_cache) > _FEED_ITEMS_CACHE_MAX:
-        _feed_items_cache.popitem(last=False)
-    return items
+        if title and link:
+            item = {
+                "title": title,
+                "link": link,
+                "source": source_name,
+                "published": published,
+                "description": desc,
+                "thumbnail": thumb,
+                "readingTime": reading_time,
+            }
+            if is_ai:
+                candidate = (_score_ai_article(item), scanned, item)
+                if len(candidates) < 40:
+                    heapq.heappush(candidates, candidate)
+                elif candidate[:2] > candidates[0][:2]:
+                    heapq.heapreplace(candidates, candidate)
+            else:
+                items.append(item)
+        entry.clear()
+        scanned += 1
+        if scanned >= (1000 if is_ai else 40):
+            break
+    if is_ai:
+        return [candidate[2] for candidate in sorted(candidates, reverse=True)]
+    return items[:12]
 
 
 _DEDUP_RE = re.compile(r"\W+")
 
 
+def _paper_key(link: str) -> str:
+    parsed = urllib.parse.urlsplit(link)
+    if parsed.hostname not in {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}:
+        return ""
+    path = re.sub(r"^/(?:abs|pdf)/", "", parsed.path).removesuffix(".pdf")
+    return re.sub(r"v\d+$", "", path)
+
+
 def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
     """Deduplicate, score, cross-source-boost, and rank a flat list of feed items."""
-    seen_titles: set[str] = set()
+    seen_titles: dict[str, dict] = {}
+    seen_papers: dict[str, dict] = {}
     unique: list[dict] = []
     is_ai       = category == "ai_research"
     is_football = category == "football"
 
     for item in all_items:
-        key = _DEDUP_RE.sub("", item["title"].lower())[:50]
-        if key not in seen_titles:
-            seen_titles.add(key)
+        key = _DEDUP_RE.sub("", item["title"].lower())
+        paper_key = _paper_key(item.get("link", "")) if is_ai else ""
+        existing = seen_titles.get(key)
+        if existing is None and paper_key:
+            existing = seen_papers.get(paper_key)
+        if existing is not None:
+            existing["_coverage"].add(item.get("source", ""))
             if is_ai:
-                item["tag"]   = _tag_ai_article(item)
-                item["score"] = _score_ai_article(item)
-            elif is_football:
-                item["tag"]   = _tag_article(item)
-                item["score"] = _score_football_article(item)
-            else:
-                item["tag"]   = _tag_article(item)
-                item["score"] = _score_article(item)
-            # Compute fingerprint only for unique items (not all)
-            item["_fp"] = _title_fingerprint(item["title"])
-            unique.append(item)
+                existing["upvotes"] = max(existing.get("upvotes", 0), item.get("upvotes", 0))
+                if len(item.get("description", "")) > len(existing.get("description", "")):
+                    existing["description"] = item["description"]
+                if AI_SOURCE_TIERS.get(item.get("source", ""), 0) > AI_SOURCE_TIERS.get(existing.get("source", ""), 0):
+                    existing["source"] = item["source"]
+            seen_titles[key] = existing
+            if paper_key:
+                seen_papers[paper_key] = existing
+            continue
+        item = dict(item)
+        item["_coverage"] = {item.get("source", "")}
+        seen_titles[key] = item
+        if paper_key:
+            seen_papers[paper_key] = item
+        unique.append(item)
+
+    for item in unique:
+        if is_ai:
+            item["tag"] = _tag_ai_article(item)
+            item["score"] = _score_ai_article(item)
+        elif is_football:
+            item["tag"] = _tag_article(item)
+            item["score"] = _score_football_article(item)
+        else:
+            item["tag"] = _tag_article(item)
+            item["score"] = _score_article(item)
+        item["_fp"] = _title_fingerprint(item["title"])
 
     def _cross_source_name(src: str) -> str:
         return "arXiv" if src.startswith("arXiv") else src
 
-    # Build a compact index: source → list of fingerprints (one per unique item)
-    _src_fps: dict[str, list[frozenset]] = {}
-    for item in unique:
-        src = _cross_source_name(item.get("source", ""))
-        _src_fps.setdefault(src, []).append(item["_fp"])
+    token_index: dict[str, set[int]] = {}
+    for index, item in enumerate(unique):
+        for token in item["_fp"]:
+            token_index.setdefault(token, set()).add(index)
 
-    for item in unique:
+    for index, item in enumerate(unique):
         fp = item["_fp"]
-        item_source = _cross_source_name(item.get("source", ""))
-        if len(fp) < 2:
-            continue
-        cross_count = 0
-        for other_src, fps_list in _src_fps.items():
-            if other_src == item_source:
-                continue
-            for other_fp in fps_list:
-                if len(other_fp) > 0 and len(fp & other_fp) / max(len(fp), len(other_fp)) >= 0.45:
-                    cross_count += 1
-                    break  # one match per source is enough
-        if cross_count > 0:
-            item["score"] = item.get("score", 0) + min(cross_count * 3.0, 12.0)
+        covered = {_cross_source_name(source) for source in item["_coverage"]}
+        candidates = set()
+        for token in fp:
+            candidates.update(token_index[token])
+        if len(fp) >= 2:
+            for other_index in candidates:
+                if other_index == index:
+                    continue
+                other = unique[other_index]
+                other_fp = other["_fp"]
+                if len(fp & other_fp) / max(len(fp), len(other_fp)) >= 0.45:
+                    covered.update(_cross_source_name(source) for source in other["_coverage"])
+        item["score"] += min(max(len(covered) - 1, 0) * 3.0, 12.0)
 
     unique.sort(key=lambda x: x.get("score", 0), reverse=True)
 
@@ -1073,13 +1114,51 @@ def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
                 diverse.append(item)
         unique = diverse
 
+    if is_ai:
+        source_counts: dict[str, int] = {}
+        diverse = []
+        for item in unique:
+            source = _cross_source_name(item.get("source", ""))
+            limit = 8 if source in {"arXiv", "HF Daily Papers"} else 4
+            if source_counts.get(source, 0) < limit:
+                diverse.append(item)
+                source_counts[source] = source_counts.get(source, 0) + 1
+        unique = diverse
+
     result = unique[:30]
     for item in result:
         item.pop("_fp", None)
+        item.pop("_coverage", None)
     return result
 
 
 _FEED_FETCH_SEM = asyncio.Semaphore(6)  # max 6 concurrent feed fetches to limit RAM spikes
+_inflight: dict[str, asyncio.Task] = {}
+_feed_subscribers: dict[str, set[asyncio.Queue]] = {}
+
+
+def _shared_task(key: str, fetcher) -> asyncio.Task:
+    task = _inflight.get(key)
+    if task is None:
+        task = asyncio.create_task(fetcher())
+        _inflight[key] = task
+
+        def cleanup(completed):
+            if _inflight.get(key) is completed:
+                _inflight.pop(key, None)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(cleanup)
+    return task
+
+
+def _cached_feed_result(category: str):
+    entry = _cache.raw_get(f"feeds_{category}")
+    ttl = CACHE_TTL_AI if category == "ai_research" else CACHE_TTL
+    if entry and not entry["data"]:
+        ttl = 30
+    return _cached(f"feeds_{category}", ttl)
 
 
 async def _fetch_feed_throttled(name: str, url: str) -> list[dict]:
@@ -1089,36 +1168,45 @@ async def _fetch_feed_throttled(name: str, url: str) -> list[dict]:
 
 async def _fetch_all_feeds(category: str) -> list[dict]:
     """Return category feed items from cache, or fetch and process all."""
-    ttl = CACHE_TTL_AI if category == "ai_research" else CACHE_TTL
-    cached = _cached(f"feeds_{category}", ttl)
+    cached = _cached_feed_result(category)
     if cached is not None:
         return cached
+    return await asyncio.shield(_shared_task(f"feeds_{category}", lambda: _refresh_feeds(category)))
 
+
+async def _refresh_feeds(category: str) -> list[dict]:
     feeds = RSS_FEEDS.get(category, [])
     tasks = [asyncio.create_task(_fetch_feed_throttled(n, u)) for n, u in feeds]
-
-    hf_task = None
     if category == "ai_research":
-        hf_task = asyncio.create_task(_fetch_hf_daily_papers())
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks.append(asyncio.create_task(_fetch_hf_daily_papers()))
     all_items: list[dict] = []
-    for r in results:
-        if isinstance(r, list):
-            all_items.extend(r)
-
-    if hf_task is not None:
-        hf_result = await hf_task
-        if isinstance(hf_result, list):
-            for p in hf_result:
-                p["source"] = "HF Daily Papers"
-            all_items.extend(hf_result)
-
+    last_emit = time.monotonic()
+    try:
+        async with asyncio.timeout(30):
+            for count, completed in enumerate(asyncio.as_completed(tasks), 1):
+                try:
+                    batch = await completed
+                except Exception:
+                    continue
+                all_items.extend(batch)
+                now = time.monotonic()
+                if all_items and (count == 1 or count % 6 == 0 or now - last_emit >= 2):
+                    subscribers = _feed_subscribers.get(category, ())
+                    if subscribers:
+                        partial = _process_feeds(all_items, category)
+                        for queue in subscribers:
+                            if queue.full():
+                                queue.get_nowait()
+                            queue.put_nowait(partial)
+                    last_emit = now
+    except TimeoutError:
+        pass
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     result = _process_feeds(all_items, category)
     _set_cache(f"feeds_{category}", result)
-    # Free intermediate data and trigger GC after heavy processing
-    del all_items
-    gc.collect()
     return result
 
 
@@ -1559,13 +1647,20 @@ async def _fetch_all_scores() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 async def _fetch_hf_daily_papers() -> list[dict]:
+    cached = _cached("hf_daily_papers", 3600)
+    if cached is not None:
+        return cached
+    return await asyncio.shield(_shared_task("hf_daily_papers", _load_hf_daily_papers))
+
+
+async def _load_hf_daily_papers() -> list[dict]:
     try:
         resp = await _http_client.get("https://huggingface.co/api/daily_papers")
         if resp.status_code != 200:
             return []
         papers = resp.json()
         items = []
-        for p in papers[:20]:
+        for p in papers[:100]:
             paper    = p.get("paper", {})
             title    = paper.get("title", "")
             abstract = paper.get("summary", "")
@@ -1580,11 +1675,14 @@ async def _fetch_hf_daily_papers() -> list[dict]:
                 "link":        f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else "",
                 "source":      "HF Daily Papers",
                 "published":   pub_date,
-                "description": (abstract[:157] + "...") if len(abstract) > 160 else abstract,
+                "description": (abstract[:1197] + "...") if len(abstract) > 1200 else abstract,
                 "thumbnail":   thumbnail,
                 "upvotes":     upvotes,
                 "paper_id":    arxiv_id,
             })
+        items = heapq.nlargest(40, items, key=_score_ai_article)
+        if items:
+            _set_cache("hf_daily_papers", items)
         return items
     except Exception:
         return []
@@ -1634,12 +1732,10 @@ async def _fetch_trending() -> dict:
     if not isinstance(models, list):
         models = []
 
+    papers = [dict(paper) for paper in papers]
     for p in papers:
         p["tag"]   = _tag_ai_article(p)
         p["score"] = _score_ai_article(p)
-        upvotes = p.get("upvotes", 0)
-        if upvotes > 0:
-            p["score"] += min(math.log2(upvotes + 1) * 2.0, 10.0)
 
     papers.sort(key=lambda x: x.get("score", 0), reverse=True)
     result = {"papers": papers, "models": models}
@@ -2024,63 +2120,36 @@ async def api_news_stream(request: Request):
     if category not in RSS_FEEDS:
         return JSONResponse({"error": "Unknown category"}, status_code=400)
 
-    cache_key = f"feeds_{category}"
-
     async def event_gen():
-        # Serve from cache immediately if fresh
-        cached = _cached(cache_key)
+        cached = _cached_feed_result(category)
         if cached is not None:
             yield f"data: {json.dumps(cached)}\n\n"
             yield "event: done\ndata: {}\n\n"
             return
 
-        feeds = RSS_FEEDS.get(category, [])
-        queue: asyncio.Queue = asyncio.Queue()
-        task_count = len(feeds) + (1 if category == "ai_research" else 0)
-
-        async def fetch_one(name: str, url: str) -> None:
-            items = await _fetch_feed(name, url)
-            await queue.put(items)
-
-        async def fetch_hf() -> None:
-            papers = await _fetch_hf_daily_papers()
-            for p in papers:
-                p["source"] = "HF Daily Papers"
-            await queue.put(papers)
-
-        tasks = [asyncio.create_task(fetch_one(n, u)) for n, u in feeds]
-        if category == "ai_research":
-            tasks.append(asyncio.create_task(fetch_hf()))
-
-        all_items: list[dict] = []
-        done_count = 0
-        last_emit = time.monotonic()
-
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        _feed_subscribers.setdefault(category, set()).add(queue)
+        task = _shared_task(f"feeds_{category}", lambda: _refresh_feeds(category))
+        update = asyncio.create_task(queue.get())
         try:
-            while done_count < task_count:
-                try:
-                    batch = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    break
-                all_items.extend(batch)
-                done_count += 1
-
-                now = time.monotonic()
-                # Emit partial every 6 feeds or every 3 seconds (reduced frequency)
-                if done_count % 6 == 0 or (now - last_emit) >= 3.0:
-                    partial = _process_feeds(list(all_items), category)
+            while not task.done():
+                completed, _ = await asyncio.wait({task, update}, timeout=15, return_when=asyncio.FIRST_COMPLETED)
+                if update in completed:
+                    partial = update.result()
                     yield f"data: {json.dumps(partial)}\n\n"
-                    del partial
-                    last_emit = now
+                    update = asyncio.create_task(queue.get())
+                elif not completed:
+                    yield ": keep-alive\n\n"
+            final = task.result()
+            yield f"data: {json.dumps(final)}\n\n"
+            yield "event: done\ndata: {}\n\n"
         finally:
-            for t in tasks:
-                t.cancel()
-
-        final = _process_feeds(all_items, category)
-        _set_cache(cache_key, final)
-        yield f"data: {json.dumps(final)}\n\n"
-        yield "event: done\ndata: {}\n\n"
-        del all_items
+            update.cancel()
+            await asyncio.gather(update, return_exceptions=True)
+            subscribers = _feed_subscribers.get(category, set())
+            subscribers.discard(queue)
+            if not subscribers:
+                _feed_subscribers.pop(category, None)
 
     return StreamingResponse(
         event_gen(),
