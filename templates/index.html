@@ -148,13 +148,25 @@
     <!-- AI / ML Research -->
     <section class="col col-ai" id="colAi">
       <div class="col-head">
-        <h2 class="col-title">AI Research <span class="col-count" id="aiCount"></span></h2>
-        <nav class="pill-nav" id="aiFilters">
+        <h2 class="col-title">Research &amp; Practice <span class="col-count" id="aiCount"></span></h2>
+        <select id="aiKindFilter" class="research-kind" aria-label="Research format">
+          <option value="all">All formats</option>
+          <option value="release">Model releases</option>
+          <option value="paper">Papers</option>
+          <option value="blog">Technical blogs</option>
+          <option value="community">Discussion</option>
+        </select>
+        <nav class="pill-nav" id="aiFilters" aria-label="Research topics">
           <button class="pill active" data-filter="all">All</button>
+          <button class="pill" data-filter="Statistics">Statistics</button>
+          <button class="pill" data-filter="Causal">Causal</button>
+          <button class="pill" data-filter="Tabular">Tabular</button>
+          <button class="pill" data-filter="Time Series">Time series</button>
+          <button class="pill" data-filter="ML Systems">ML systems</button>
           <button class="pill" data-filter="LLM">LLM</button>
           <button class="pill" data-filter="RL">RL</button>
           <button class="pill" data-filter="Agents">Agents</button>
-          <button class="pill" data-filter="Retrieval">RAG</button>
+          <button class="pill" data-filter="Retrieval">Retrieval</button>
           <button class="pill" data-filter="Vision">Vision</button>
           <button class="pill" data-filter="Reasoning">Reasoning</button>
         </nav>

@@ -30,7 +30,7 @@
     return `${s}${pct.toFixed(2)}%`;
   }
 
-  function tagClass(tag) { return `tag-${tag || "General"}`; }
+  function tagClass(tag) { return `tag-${(tag || "General").replace(/\s+/g, "-")}`; }
 
   function escapeHtml(text) {
     return String(text)
@@ -311,46 +311,63 @@
 
   // ── AI Research Rendering ─────────────────────────────────────────────
   let allAiItems = [];
+  let activeAiTag = "all";
+  let activeAiKind = "all";
 
   function aiCard(item) {
     const bm = isBookmarked(item.link) ? " bookmarked" : "";
     const upvotes = item.upvotes ? `<span class="ai-upvotes" title="HuggingFace upvotes">${item.upvotes}</span>` : "";
+    const kind = { release: "Model release", paper: "Paper", blog: "Technical blog", community: "Discussion" }[item.kind] || "";
+    const learning = (item.learningSignals || []).map(escapeHtml).join(" &middot; ");
+    const citedBy = (item.citedBy || []).length
+      ? `<span class="ai-card-citation">Cited by ${escapeHtml(item.citedBy.join(", "))}</span>` : "";
     return `<a href="${escapeHtml(item.link)}" target="_blank" rel="noopener" class="ai-card${bm}" data-url="${escapeHtml(item.link)}">
       <div class="ai-card-head">
         <span class="news-tag ${tagClass(item.tag)}">${item.tag}</span>
+        ${item.kind === "release" ? '<span class="news-tag tag-release">Model release</span>' : ""}
         <span class="ai-card-source">${escapeHtml(item.source)}</span>
         ${upvotes}
       </div>
       <div class="ai-card-title">${escapeHtml(item.title)}</div>
       <div class="ai-card-desc">${escapeHtml(item.description || "")}</div>
+      ${learning ? `<div class="ai-card-learning">${learning}</div>` : ""}
       <div class="ai-card-meta">
+        <span>${kind}</span>
         <span>${timeAgo(item.published)}</span>
+        ${citedBy}
       </div>
     </a>`;
   }
 
   function renderAi(container, items) {
     if (!items.length) {
-      container.innerHTML = `<div class="error-state">No research articles found.</div>`;
+      container.innerHTML = `<div class="error-state">No research matches these filters.</div>`;
       return;
     }
     container.innerHTML = items.map(aiCard).join("");
   }
 
   function loadAi() {
-    return subscribeNews("ai_research", "#aiContainer", (items, c) => {
+    return subscribeNews("ai_research", "#aiContainer", (items) => {
       allAiItems = items;
-      renderAi(c, items);
-      updateColCount("aiCount", items.length);
+      applyAiFilter();
     });
   }
 
-  function applyAiFilter(tag) {
-    let items = tag === "all" ? allAiItems : allAiItems.filter((i) => i.tag === tag);
-    if (items.length < 2) items = allAiItems;
+  function applyAiFilter(tag = activeAiTag) {
+    activeAiTag = tag;
+    const items = allAiItems.filter((item) =>
+      (activeAiTag === "all" || item.tag === activeAiTag) &&
+      (activeAiKind === "all" || item.kind === activeAiKind)
+    );
     renderAi($("#aiContainer"), items);
-    updateColCount("aiCount", items.length);
+    $("#aiCount").textContent = `(${items.length})`;
   }
+
+  $("#aiKindFilter").addEventListener("change", (event) => {
+    activeAiKind = event.target.value;
+    applyAiFilter();
+  });
 
   $$("#aiFilters .pill").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -431,23 +448,27 @@
       ? when.toLocaleDateString("en-IN", { month: "short", day: "numeric" })
       : "";
     const cardTitle = `${m.home} ${m.home_score}-${m.away_score} ${m.away}${dateLabel ? ` · ${dateLabel}` : ""}${m.status ? ` · ${m.status}` : ""}`;
-    return `<div class="score-card" data-event-id="${m.event_id}" data-league-code="${m.league_code}" style="cursor:pointer" title="${escapeHtml(cardTitle)}">
-      <span class="score-league league-${m.league_short}">${m.league_short}</span>
-      <span class="score-team">
-        ${m.home_logo ? `<img class="score-team-logo" src="${m.home_logo}" alt="" onerror="this.style.display='none'">` : ""}
-        <span class="score-team-name">${m.home}</span>
-      </span>
-      <span class="score-result">${m.home_score} - ${m.away_score}</span>
-      <span class="score-team">
-        <span class="score-team-name">${m.away}</span>
-        ${m.away_logo ? `<img class="score-team-logo" src="${m.away_logo}" alt="" onerror="this.style.display='none'">` : ""}
-      </span>
+    const status = m.state === "in" ? `LIVE ${m.status || ""}` : (m.status_detail || m.status || "");
+    return `<div class="score-card" data-event-id="${escapeHtml(m.event_id)}" data-league-code="${escapeHtml(m.league_code)}" style="cursor:pointer" title="${escapeHtml(cardTitle)}">
+      <div class="score-match-main">
+        <span class="score-league league-${escapeHtml(m.league_short)}">${escapeHtml(m.league_short)}</span>
+        <span class="score-team">
+          ${m.home_logo ? `<img class="score-team-logo" src="${escapeHtml(m.home_logo)}" alt="" onerror="this.style.display='none'">` : ""}
+          <span class="score-team-name">${escapeHtml(m.home)}</span>
+        </span>
+        <span class="score-result">${escapeHtml(m.home_score)} - ${escapeHtml(m.away_score)}</span>
+        <span class="score-team">
+          <span class="score-team-name">${escapeHtml(m.away)}</span>
+          ${m.away_logo ? `<img class="score-team-logo" src="${escapeHtml(m.away_logo)}" alt="" onerror="this.style.display='none'">` : ""}
+        </span>
+      </div>
+      <div class="score-match-meta${m.state === "in" ? " score-live" : ""}">${escapeHtml(dateLabel)} &middot; ${escapeHtml(status)}</div>
     </div>`;
   }
 
   async function fetchScores() {
     try {
-      const r = await fetch("/api/scores");
+      const r = await fetch("/api/scores", { signal: AbortSignal.timeout(15000) });
       if (!r.ok) throw new Error();
       const matches = await r.json();
       latestScores = matches;

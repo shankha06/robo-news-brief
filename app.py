@@ -18,6 +18,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 
 # Use OS trust store (macOS Keychain / Linux ca-certificates) so corporate SSL
 # proxy certificates are trusted without disabling verification entirely.
@@ -122,6 +123,9 @@ RSS_FEEDS = {
         ("arXiv CS.LG", "https://rss.arxiv.org/rss/cs.LG"),
         ("arXiv CS.CV", "https://rss.arxiv.org/rss/cs.CV"),
         ("arXiv CS.IR", "https://rss.arxiv.org/rss/cs.IR"),
+        ("arXiv stat.ML", "https://rss.arxiv.org/rss/stat.ML"),
+        ("arXiv stat.ME", "https://rss.arxiv.org/rss/stat.ME"),
+        ("JMLR", "https://jmlr.org/jmlr.xml"),
         # Lab blogs (high-signal, infrequent)
         ("OpenAI", "https://openai.com/news/rss.xml"),
         ("Anthropic", "https://news.google.com/rss/search?q=site:anthropic.com+research+OR+engineering&hl=en-US&gl=US&ceid=US:en"),
@@ -139,6 +143,10 @@ RSS_FEEDS = {
         ("Sebastian Raschka", "https://magazine.sebastianraschka.com/feed"),
         ("Import AI", "https://importai.substack.com/feed"),
         ("Simon Willison", "https://simonwillison.net/atom/entries/"),
+        ("BAIR", "https://bair.berkeley.edu/blog/feed.xml"),
+        ("Chip Huyen", "https://huyenchip.com/feed.xml"),
+        ("Statistical Modeling", "https://statmodeling.stat.columbia.edu/feed/"),
+        ("Maarten Grootendorst", "https://newsletter.maartengrootendorst.com/feed"),
         # Community (cap items heavily)
         ("r/MachineLearning", "https://www.reddit.com/r/MachineLearning/.rss"),
         ("r/LocalLLaMA", "https://www.reddit.com/r/LocalLLaMA/.rss"),
@@ -524,6 +532,10 @@ AI_SOURCE_TIERS = {
     "Lil'Log": 6.0, "HuggingFace": 5.0,
     "Sebastian Raschka": 6.0, "Import AI": 5.0,
     "Simon Willison": 4.5,
+    "BAIR": 6.0, "Chip Huyen": 6.0, "Statistical Modeling": 5.0,
+    "JMLR": 7.0, "arXiv stat.ML": 2.0, "arXiv stat.ME": 2.0,
+    "Maarten Grootendorst": 6.0, "Expert-cited Papers": 7.0,
+    "HF Model Releases": 6.0,
     "arXiv CS.CL": 2.0, "arXiv CS.AI": 2.0, "arXiv CS.LG": 2.0,
     "arXiv CS.CV": 2.0, "arXiv CS.IR": 2.0,
     "r/MachineLearning": 2.5, "r/LocalLLaMA": 2.0, "HN AI": 2.5,
@@ -589,9 +601,20 @@ AI_CATEGORY_TAGS = {
     "Agents": ["agent", "tool use", "function calling", "multi-agent", "agentic",
                "planning", "web agent", "code agent", "mcp", "a2a"],
     "Reasoning": ["reasoning", "chain of thought", "cot", "tree of thought",
-                  "step-by-step", "math", "logic", "benchmark"],
+                  "math", "logic"],
     "Vision": ["multimodal", "vision language", "image", "video", "diffusion",
                "text-to-image", "mllm", "visual"],
+    "Statistics": ["statistical inference", "uncertainty", "calibration", "bayesian",
+                   "conformal prediction", "hypothesis testing", "bootstrap", "probabilistic"],
+    "Causal": ["causal inference", "causal discovery", "causal effect", "causality",
+              "treatment effect", "a/b testing", "randomized experiment", "counterfactual"],
+    "Tabular": ["tabular", "gradient boosting", "xgboost", "lightgbm", "catboost",
+                "random forest", "feature engineering", "decision tree", "regression"],
+    "Time Series": ["time series", "forecasting", "temporal", "anomaly detection"],
+    "ML Systems": ["inference optimization", "quantization", "distributed training",
+                   "model serving", "mlops", "data quality", "data drift", "observability",
+                   "kernel fusion", "gpu kernel", "data pipeline", "cuda", "triton",
+                   "profiling", "model monitoring"],
 }
 
 _AI_SOTA_RE = re.compile(
@@ -772,31 +795,117 @@ _AI_EVIDENCE_RE = re.compile(
     r"latency|throughput|memory|reproducib\w*|experiment\w*|open[- ]source)\b",
     re.IGNORECASE,
 )
+_AI_LEARNING_SIGNALS = tuple(
+    (label, re.compile(pattern, re.IGNORECASE))
+    for label, pattern in (
+        ("Methods & theory", r"\b(?:derivation|proof|theorem|bias[- ]variance|causal inference|"
+         r"conformal prediction|bayesian|gradient boosting|estimator|objective function|"
+         r"(?:convex|non[- ]convex|stochastic|gradient|numerical|black[- ]box|multi[- ]objective|policy) optimization)\b"),
+        ("Evaluation & reliability", r"\b(?:ablation|confidence interval|statistical significance|"
+         r"data leakage|distribution shift|out[- ]of[- ]distribution|failure modes?|"
+         r"error analysis|reproducib\w*|baselines?)\b"),
+        ("Implementation", r"\b(?:implementation|from scratch|source code|notebook|walkthrough|"
+         r"worked example|step[- ]by[- ]step|code walkthrough)\b"),
+        ("Production lessons", r"\b(?:trade[- ]offs?|postmortem|lessons learned|case study|"
+         r"production|profiling|bottleneck|model monitoring|data quality|data drift)\b"),
+    )
+)
+_AI_PROMOTION_RE = re.compile(
+    r"\b(?:\d+% off|pricing|funding round|register now|sponsored|partnership|"
+    r"introducing our|now available|launching|product launch|product signups|customer story)\b", re.IGNORECASE,
+)
+_AI_COMMUNITY_SOURCES = frozenset({"r/MachineLearning", "r/LocalLLaMA", "HN AI", "Google AI News"})
+_AI_CURATED_BLOGS = frozenset({"Lil'Log", "Sebastian Raschka", "Simon Willison", "BAIR",
+                               "Chip Huyen", "Statistical Modeling", "Maarten Grootendorst"})
+_MODEL_RELEASE_SOURCES = frozenset({"OpenAI", "Anthropic", "Google AI", "DeepMind", "Meta AI",
+                                    "Mistral", "Nvidia AI", "Microsoft Research", "Apple ML", "HuggingFace"})
+_MODEL_PUBLISHERS = frozenset({"openai", "google", "meta-llama", "mistralai", "deepseek-ai", "qwen",
+                               "minimaxai", "moonshotai", "zai-org", "coherelabs", "nvidia", "microsoft",
+                               "apple", "allenai", "baai", "jinaai", "intfloat", "huggingfacetb",
+                               "black-forest-labs", "stabilityai", "lightricks", "sentence-transformers"})
+_MODEL_NAME_RE = re.compile(
+    r"\b(?:gpt|claude|gemini|llama|deepseek|qwen|mistral|minimax|gemma|grok|kimi|"
+    r"nemotron|olmo|voxtral|flux|whisper|images?\s*\d|"
+    r"(?:language|reasoning|embedding|multimodal|open[- ]weight) models?)\b", re.IGNORECASE,
+)
+_MODEL_LAUNCH_RE = re.compile(
+    r"\b(?:introducing|announc(?:e|es|ed|ing)|releas(?:e|es|ed|ing)|launch(?:es|ed|ing)?|"
+    r"unveil(?:s|ed)?|now available|is here|new model)\b", re.IGNORECASE,
+)
+
+
+def _is_model_release(item: dict) -> bool:
+    source = item.get("source", "")
+    registry = source == "HF Model Releases"
+    if not registry and source not in _MODEL_RELEASE_SOURCES:
+        return False
+    try:
+        published = datetime.fromisoformat(item.get("published", ""))
+        published = published.replace(tzinfo=published.tzinfo or timezone.utc)
+        age = (datetime.now(timezone.utc) - published).total_seconds() / 86400
+    except (ValueError, TypeError):
+        return False
+    if not 0 <= age <= (30 if registry else 14):
+        return False
+    return registry or bool(_MODEL_LAUNCH_RE.search(item.get("title", "")) and
+                            _MODEL_NAME_RE.search(item.get("title", "") + " " + item.get("description", "")[:400]))
+
+
+def _learning_signals(item: dict) -> list[str]:
+    text = item.get("title", "") + " " + item.get("description", "")
+    return [label for label, pattern in _AI_LEARNING_SIGNALS if pattern.search(text)]
+
+
+def _publisher_release(item: dict) -> bool:
+    return (item.get("source") in _MODEL_RELEASE_SOURCES or
+            item.get("model_id", "").split("/", 1)[0].lower() in _MODEL_PUBLISHERS)
+
+
+def _research_kind(item: dict) -> str:
+    source = item.get("source", "")
+    if _is_model_release(item):
+        return "release"
+    if source.startswith("arXiv") or source in {"HF Daily Papers", "JMLR", "Expert-cited Papers"}:
+        return "paper"
+    return "community" if source in _AI_COMMUNITY_SOURCES else "blog"
 
 
 def _score_ai_article(item: dict) -> float:
     title  = item.get("title", "").lower()
     desc   = item.get("description", "").lower()
-    pub    = item.get("published", "")
+    pub    = item.get("citedAt") or item.get("published", "")
     source = item.get("source", "")
     importance = 0.0
+    text = title + " " + desc
+    learning = _learning_signals(item)
+    release = _is_model_release(item)
 
     for _, pattern in _AI_TOPIC_PATTERNS:
         if pattern.search(title):
-            importance += 5.0
-        elif pattern.search(desc):
             importance += 2.0
-    importance = min(importance, 18.0)
+        elif pattern.search(desc):
+            importance += 1.0
+    importance = min(importance, 6.0)
+    importance += len(learning) * 5.0
+    if source in _AI_CURATED_BLOGS and learning:
+        importance += 4.0
     evidence = len(set(match.group().lower() for match in _AI_EVIDENCE_RE.finditer(title + " " + desc)))
     importance += min(evidence * 1.5, 6.0)
-    if source.startswith("arXiv") or source == "HF Daily Papers":
+    if _research_kind(item) == "paper":
         importance += 3.0
-    if _AI_NOVEL_RE.search(title + " " + desc):
-        importance += 2.0
     importance += min(math.log2(max(item.get("upvotes", 0), 0) + 1), 5.0)
+    importance += min(len(item.get("citedBy", [])) * 4.0, 8.0)
+    if release:
+        importance += 14.0
+        if source == "HF Model Releases":
+            importance += min(math.log2(max(item.get("trending_score", 0), 0) + 1), 5)
+            if item.get("model_id", "").split("/", 1)[0].lower() in _MODEL_PUBLISHERS:
+                importance += 3
 
-    if _AI_NOISE_RE.search(title):
+    if _AI_NOISE_RE.search(title) and not learning:
         importance -= 15.0
+    if _AI_PROMOTION_RE.search(title) and not release:
+        importance -= 12.0
 
     age_h = None
     if pub:
@@ -807,9 +916,15 @@ def _score_ai_article(item: dict) -> float:
     if age_h is None:
         recency_mult = 0.7
     else:
-        recency_mult = math.exp(-math.log(2) * max(age_h, 0) / 168)
+        is_paper = _research_kind(item) == "paper"
+        half_life = 24 * (30 if is_paper and not item.get("citedBy") else 180)
+        if release:
+            half_life = 24 * 10
+        recency_mult = math.exp(-math.log(2) * max(age_h, 0) / half_life)
 
     source_boost = AI_SOURCE_TIERS.get(item.get("source", ""), 1.5)
+    if source in _AI_COMMUNITY_SOURCES:
+        source_boost *= 0.5
     return (max(importance, 0.0) + source_boost) * recency_mult
 
 
@@ -920,6 +1035,21 @@ _STRIP_TAGS_RE = re.compile(r"<[^>]+>")
 _ARXIV_BOILERPLATE_RE = re.compile(r"^arXiv:.*?Abstract:\s*", re.DOTALL)
 
 
+class _CitedPaperParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.paper_ids = []
+
+    def handle_starttag(self, tag, attributes):
+        if tag != "a" or len(self.paper_ids) >= 8:
+            return
+        link = dict(attributes).get("href") or ""
+        paper_id = _paper_key(link)
+        if (re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})", paper_id, re.IGNORECASE)
+                and paper_id not in self.paper_ids):
+            self.paper_ids.append(paper_id)
+
+
 def _parse_feed(source_name: str, content: bytes | bytearray) -> list[dict]:
     is_ai = source_name in AI_SOURCE_TIERS
     items = []
@@ -958,6 +1088,11 @@ def _parse_feed(source_name: str, content: bytes | bytearray) -> list[dict]:
                 pass
 
         desc = _txt("description") or _txt("summary") or _txt("content")
+        cited_papers = []
+        if source_name in _AI_CURATED_BLOGS:
+            parser = _CitedPaperParser()
+            parser.feed(desc[:131072])
+            cited_papers = parser.paper_ids
         desc = html.unescape(_STRIP_TAGS_RE.sub("", desc)).strip()
         desc = _ARXIV_BOILERPLATE_RE.sub("", desc)
         limit = 1200 if is_ai else 320
@@ -993,6 +1128,8 @@ def _parse_feed(source_name: str, content: bytes | bytearray) -> list[dict]:
                 "thumbnail": thumb,
                 "readingTime": reading_time,
             }
+            if cited_papers:
+                item["citedPapers"] = cited_papers
             if is_ai:
                 candidate = (_score_ai_article(item), scanned, item)
                 if len(candidates) < 40:
@@ -1021,6 +1158,64 @@ def _paper_key(link: str) -> str:
     return re.sub(r"v\d+$", "", path)
 
 
+def _select_research(items: list[dict]) -> list[dict]:
+    selected = []
+    selected_ids = set()
+    source_counts: dict[str, int] = {}
+    topic_counts: dict[str, int] = {}
+    kind_counts: dict[str, int] = {}
+
+    def take(item):
+        source = item.get("source", "")
+        source = "arXiv" if source.startswith("arXiv") else source
+        kind = item["kind"]
+        tag = item["tag"]
+        source_limit = 8 if source in {"arXiv", "HF Daily Papers"} else 4
+        if source == "HF Model Releases":
+            source_limit = 2
+        if kind == "blog":
+            source_limit = 3 if source in _AI_CURATED_BLOGS else 2
+        if (id(item) in selected_ids or source_counts.get(source, 0) >= source_limit
+                or topic_counts.get(tag, 0) >= 6
+            or (kind == "release" and kind_counts.get(kind, 0) >= 4)
+                or (kind == "community" and kind_counts.get(kind, 0) >= 2)):
+            return False
+        selected.append(item)
+        selected_ids.add(id(item))
+        source_counts[source] = source_counts.get(source, 0) + 1
+        topic_counts[tag] = topic_counts.get(tag, 0) + 1
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        return True
+
+    for item in sorted(items, key=lambda item: (_publisher_release(item), item["score"]), reverse=True):
+        if item["kind"] == "release":
+            take(item)
+    for topic in ("Statistics", "Causal", "Tabular", "Time Series", "ML Systems"):
+        for item in items:
+            if item["tag"] == topic and item["score"] >= 5 and item["learningSignals"]:
+                if take(item):
+                    break
+    for kind in ("paper", "blog"):
+        candidates = items
+        if kind == "blog":
+            candidates = sorted(items, key=lambda item: (
+                item.get("source") in _AI_CURATED_BLOGS, item["score"]
+            ), reverse=True)
+        for item in candidates:
+            if kind_counts.get(kind, 0) >= 8:
+                break
+            if item["kind"] == kind and item["learningSignals"] and item["score"] >= 5:
+                take(item)
+    for item in items:
+        if len(selected) >= 30:
+            break
+        take(item)
+    return sorted(selected, key=lambda item: (
+        item["kind"] == "release", _publisher_release(item) if item["kind"] == "release" else False,
+        item["score"]
+    ), reverse=True)
+
+
 def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
     """Deduplicate, score, cross-source-boost, and rank a flat list of feed items."""
     seen_titles: dict[str, dict] = {}
@@ -1039,6 +1234,9 @@ def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
             existing["_coverage"].add(item.get("source", ""))
             if is_ai:
                 existing["upvotes"] = max(existing.get("upvotes", 0), item.get("upvotes", 0))
+                existing["citedBy"] = sorted(set(existing.get("citedBy", [])) | set(item.get("citedBy", [])))[:3]
+                if item.get("citedAt", "") > existing.get("citedAt", ""):
+                    existing["citedAt"] = item["citedAt"]
                 if len(item.get("description", "")) > len(existing.get("description", "")):
                     existing["description"] = item["description"]
                 if AI_SOURCE_TIERS.get(item.get("source", ""), 0) > AI_SOURCE_TIERS.get(existing.get("source", ""), 0):
@@ -1058,6 +1256,8 @@ def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
         if is_ai:
             item["tag"] = _tag_ai_article(item)
             item["score"] = _score_ai_article(item)
+            item["kind"] = _research_kind(item)
+            item["learningSignals"] = _learning_signals(item)
         elif is_football:
             item["tag"] = _tag_article(item)
             item["score"] = _score_football_article(item)
@@ -1065,6 +1265,9 @@ def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
             item["tag"] = _tag_article(item)
             item["score"] = _score_article(item)
         item["_fp"] = _title_fingerprint(item["title"])
+        if is_ai:
+            item["_fp"] -= {"llm", "llms", "model", "models", "agent", "agents", "benchmark",
+                            "benchmarks", "learning", "language", "large", "evaluating", "evaluation"}
 
     def _cross_source_name(src: str) -> str:
         return "arXiv" if src.startswith("arXiv") else src
@@ -1088,7 +1291,7 @@ def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
                 other_fp = other["_fp"]
                 if len(fp & other_fp) / max(len(fp), len(other_fp)) >= 0.45:
                     covered.update(_cross_source_name(source) for source in other["_coverage"])
-        item["score"] += min(max(len(covered) - 1, 0) * 3.0, 12.0)
+        item["score"] += min(max(len(covered) - 1, 0) * 3.0, 6.0 if is_ai else 12.0)
 
     unique.sort(key=lambda x: x.get("score", 0), reverse=True)
 
@@ -1115,15 +1318,7 @@ def _process_feeds(all_items: list[dict], category: str) -> list[dict]:
         unique = diverse
 
     if is_ai:
-        source_counts: dict[str, int] = {}
-        diverse = []
-        for item in unique:
-            source = _cross_source_name(item.get("source", ""))
-            limit = 8 if source in {"arXiv", "HF Daily Papers"} else 4
-            if source_counts.get(source, 0) < limit:
-                diverse.append(item)
-                source_counts[source] = source_counts.get(source, 0) + 1
-        unique = diverse
+        unique = _select_research(unique)
 
     result = unique[:30]
     for item in result:
@@ -1174,11 +1369,40 @@ async def _fetch_all_feeds(category: str) -> list[dict]:
     return await asyncio.shield(_shared_task(f"feeds_{category}", lambda: _refresh_feeds(category)))
 
 
+async def _fetch_cited_papers(items: list[dict]) -> list[dict]:
+    references: dict[str, dict] = {}
+    for item in sorted(items, key=_score_ai_article, reverse=True):
+        if item.get("source") not in _AI_CURATED_BLOGS or not _learning_signals(item):
+            continue
+        for paper_id in item.get("citedPapers", []):
+            if paper_id not in references and len(references) >= 12:
+                continue
+            reference = references.setdefault(paper_id, {"authors": set(), "date": ""})
+            reference["authors"].add(item["source"])
+            reference["date"] = max(reference["date"], item.get("published", ""))
+    if not references:
+        return []
+    query = urllib.parse.urlencode({"id_list": ",".join(sorted(references)), "max_results": 12})
+    url = "https://export.arxiv.org/api/query?" + query
+    try:
+        async with asyncio.timeout(5):
+            papers = await _fetch_feed_throttled("Expert-cited Papers", url)
+    except TimeoutError:
+        return []
+    result = []
+    for paper in papers:
+        reference = references.get(_paper_key(paper.get("link", "")))
+        if reference:
+            result.append({**paper, "citedBy": sorted(reference["authors"])[:3], "citedAt": reference["date"]})
+    return result
+
+
 async def _refresh_feeds(category: str) -> list[dict]:
     feeds = RSS_FEEDS.get(category, [])
     tasks = [asyncio.create_task(_fetch_feed_throttled(n, u)) for n, u in feeds]
     if category == "ai_research":
         tasks.append(asyncio.create_task(_fetch_hf_daily_papers()))
+        tasks.append(asyncio.create_task(_fetch_model_releases()))
     all_items: list[dict] = []
     last_emit = time.monotonic()
     try:
@@ -1199,6 +1423,8 @@ async def _refresh_feeds(category: str) -> list[dict]:
                                 queue.get_nowait()
                             queue.put_nowait(partial)
                     last_emit = now
+            if category == "ai_research":
+                all_items.extend(await _fetch_cited_papers(all_items))
     except TimeoutError:
         pass
     finally:
@@ -1526,6 +1752,9 @@ FOOTBALL_LEAGUES = [
     ("fifa.world", "FIFA World Cup", "WC"),
     ("uefa.euro", "UEFA European Championship", "EURO"),
     ("fifa.friendly", "International", "INTL"),
+    ("uefa.nations", "UEFA Nations League", "UNL"),
+    ("fifa.worldq.uefa", "World Cup Qualifying Europe", "WCQ"),
+    ("fifa.worldq.conmebol", "World Cup Qualifying South America", "WCQ"),
 ]
 
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
@@ -1553,15 +1782,20 @@ async def _fetch_league_scores(league_code: str, league_name: str, short: str,
                                 date_range: str) -> list[dict]:
     url = f"{ESPN_SCOREBOARD_URL.format(league=league_code)}?dates={date_range}&limit=50"
     try:
-        resp = await _http_client.get(url)
+        async with _SCORE_FETCH_SEM:
+            resp = await _http_client.get(url, timeout=5)
+        resp.raise_for_status()
         data = resp.json()
     except Exception:
         return []
 
     matches = []
     for event in data.get("events", []):
-        comp = event.get("competitions", [{}])[0]
-        status_obj = comp.get("status", {}).get("type", {})
+        competitions = event.get("competitions") or []
+        if not competitions:
+            continue
+        comp = competitions[0]
+        status_obj = (comp.get("status") or event.get("status") or {}).get("type", {})
         state  = status_obj.get("state", "")
         detail = status_obj.get("shortDetail", "")
         if state not in ("post", "in"):
@@ -1569,8 +1803,8 @@ async def _fetch_league_scores(league_code: str, league_name: str, short: str,
         teams = comp.get("competitors", [])
         if len(teams) < 2:
             continue
-        home = teams[0]
-        away = teams[1]
+        home = next((team for team in teams if team.get("homeAway") == "home"), teams[0])
+        away = next((team for team in teams if team.get("homeAway") == "away"), teams[1])
         matches.append({
             "event_id":    event.get("id", ""),
             "league_code": league_code,
@@ -1583,63 +1817,76 @@ async def _fetch_league_scores(league_code: str, league_name: str, short: str,
             "league":      league_name,
             "league_short": short,
             "status":      "FT" if state == "post" else detail,
+            "state":       state,
+            "status_detail": detail,
+            "stage":       (comp.get("type") or {}).get("text", ""),
             "date":        event.get("date", ""),
         })
     return matches
+
+
+_SCORE_FETCH_SEM = asyncio.Semaphore(6)
+
+
+def _score_match(match: dict) -> int:
+    teams = " ".join((match.get("home", ""), match.get("away", ""))).lower()
+    major_teams = set().union(*(teams for teams in TOP_TEAMS.values() if teams))
+    major_count = sum(team in teams for team in major_teams)
+    score = min(major_count, 2) * 3
+    if match.get("league_short") in {"UCL", "WC", "EURO", "UNL", "WCQ"}:
+        score += 4
+    if re.search(r"\b(?:final|semi[- ]final|quarter[- ]final|penalties|aggregate)\b",
+                 match.get("stage", "") + " " + match.get("status_detail", ""), re.IGNORECASE):
+        score += 5
+    return score
 
 
 async def _fetch_all_scores() -> list[dict]:
     cached_entry = _cache.raw_get("football_scores")
     if cached_entry:
         age = time.time() - cached_entry["ts"]
-        # Use 30m TTL for real data, 5m TTL for empty data (off-season/API down)
-        effective_ttl = 1800 if cached_entry["data"] else 300
+        effective_ttl = 30 if any(match.get("state") == "in" for match in cached_entry["data"]) else 300
+        if not cached_entry["data"]:
+            effective_ttl = 30
         if age < effective_ttl:
             return cached_entry["data"]
+    return await asyncio.shield(_shared_task("football_scores", _refresh_scores))
 
+
+async def _refresh_scores() -> list[dict]:
     now = datetime.now(timezone.utc)
-    filtered = []
-
-    # During off-season, dynamically search wider ranges to display recent matches
-    for days in (7, 30, 45, 60):
-        start = now - timedelta(days=days)
-        date_range = f"{start.strftime('%Y%m%d')}-{now.strftime('%Y%m%d')}"
-
-        tasks = [
-            asyncio.create_task(_fetch_league_scores(code, name, short, date_range))
-            for code, name, short in FOOTBALL_LEAGUES
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        all_matches: list[dict] = []
-        club_match_count = 0
-        for (code, name, short), r in zip(FOOTBALL_LEAGUES, results):
-            if isinstance(r, list):
-                is_intl = short in ("INTL", "UNL")
-                if not is_intl:
-                    club_match_count += len(r)
-                all_matches.extend(r)
-
-        if club_match_count >= 8:
-            all_matches = [m for m in all_matches if m["league_short"] not in ("INTL", "UNL")]
-
-        for m in all_matches:
-            top = TOP_TEAMS.get(m["league_short"])
-            if top is None:
-                filtered.append(m)
-                continue
-            home_lc = m["home"].lower()
-            away_lc = m["away"].lower()
-            if any(t in home_lc or home_lc in t for t in top) or \
-               any(t in away_lc or away_lc in t for t in top):
-                filtered.append(m)
-
-        if filtered:
-            break
-
-    filtered.sort(key=lambda x: x.get("date", ""), reverse=True)
-    _set_cache("football_scores", filtered)
-    return filtered
+    matches = {}
+    tasks = []
+    try:
+        async with asyncio.timeout(12):
+            for offsets in (range(3), range(3, 7)):
+                tasks = [asyncio.create_task(_fetch_league_scores(code, name, short,
+                         (now - timedelta(days=offset)).strftime("%Y%m%d")))
+                         for offset in offsets for code, name, short in FOOTBALL_LEAGUES]
+                for completed in asyncio.as_completed(tasks):
+                    try:
+                        batch = await completed
+                    except Exception:
+                        continue
+                    for match in batch:
+                        matches[(match["league_code"], match["event_id"])] = match
+                if len(matches) >= 8:
+                    break
+    except TimeoutError:
+        pass
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    result = sorted(matches.values(), key=lambda match: (
+        match.get("state") == "in", match.get("date", "")[:10],
+        _score_match(match), match.get("date", "")
+    ), reverse=True)[:30]
+    if result:
+        _set_cache("football_scores", result)
+    elif "football_scores" not in _cache:
+        _set_cache("football_scores", [])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1689,15 +1936,22 @@ async def _load_hf_daily_papers() -> list[dict]:
 
 
 async def _fetch_hf_trending_models() -> list[dict]:
+    cached = _cached("hf_trending_models", 1800)
+    if cached is not None:
+        return cached
+    return await asyncio.shield(_shared_task("hf_trending_models", _load_hf_trending_models))
+
+
+async def _load_hf_trending_models() -> list[dict]:
     try:
         resp = await _http_client.get(
             "https://huggingface.co/api/models",
-            params={"sort": "likes", "direction": "-1", "limit": "15"},
+            params={"sort": "trendingScore", "direction": "-1", "limit": "30", "full": "true"},
         )
         if resp.status_code != 200:
             return []
         models = resp.json()
-        return [
+        result = [
             {
                 "model_id": m.get("modelId", "") or m.get("id", ""),
                 "pipeline": m.get("pipeline_tag", ""),
@@ -1705,11 +1959,34 @@ async def _fetch_hf_trending_models() -> list[dict]:
                 "likes":    m.get("likes", 0),
                 "downloads": m.get("downloads", 0),
                 "link":     f"https://huggingface.co/{m.get('modelId', '') or m.get('id', '')}",
+                "created_at": m.get("createdAt", ""),
+                "last_modified": m.get("lastModified", ""),
+                "trending_score": m.get("trendingScore", 0),
             }
             for m in models
         ]
+        if result:
+            _set_cache("hf_trending_models", result)
+        return result
     except Exception:
         return []
+
+
+async def _fetch_model_releases() -> list[dict]:
+    models = await _fetch_hf_trending_models()
+    releases = []
+    for model in models:
+        item = {
+            "title": model["model_id"], "link": model["link"], "source": "HF Model Releases",
+            "published": model.get("created_at", ""), "model_id": model["model_id"],
+            "trending_score": model.get("trending_score", 0), "thumbnail": "",
+            "description": f"Task: {model.get('pipeline') or 'unspecified'}. Trending on Hugging Face; "
+                           f"{model.get('likes', 0):,} likes, {model.get('downloads', 0):,} downloads. "
+                           f"Publisher: {model['model_id'].split('/', 1)[0]}.",
+        }
+        if _is_model_release(item):
+            releases.append(item)
+    return heapq.nlargest(10, releases, key=lambda item: (_publisher_release(item), _score_ai_article(item)))
 
 
 async def _fetch_trending() -> dict:

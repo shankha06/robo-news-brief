@@ -11,6 +11,63 @@ from starlette.requests import Request
 import app
 
 
+class ScoreTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        app._cache._data.clear()
+
+    async def test_daily_score_requests_parse_event_status_and_home_away(self):
+        requests = []
+
+        def handle(request):
+            requests.append(request)
+            return httpx.Response(200, json={"events": [{"id": "1", "date": "2026-11-15T20:00Z",
+                "status": {"type": {"state": "post", "shortDetail": "After penalties"}},
+                "competitions": [{"competitors": [
+                    {"homeAway": "away", "team": {"displayName": "France"}, "score": "1"},
+                    {"homeAway": "home", "team": {"displayName": "England"}, "score": "2"}
+                ]}]}]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            with patch.object(app, "_http_client", client), patch.object(app, "_SCORE_FETCH_SEM", asyncio.Semaphore(6)):
+                matches = await app._fetch_league_scores("uefa.nations", "Nations League", "UNL", "20261115")
+        self.assertEqual(requests[0].url.params["dates"], "20261115")
+        self.assertEqual(matches[0]["home"], "England")
+        self.assertEqual(matches[0]["away"], "France")
+        self.assertEqual(matches[0]["status_detail"], "After penalties")
+
+    async def test_refresh_keeps_internationals_and_prioritizes_live(self):
+        requests = []
+
+        async def fetch(code, name, short, date):
+            requests.append(date)
+            return [{"event_id": code + date, "league_code": code, "league_short": short,
+                     "home": "England" if short == "UNL" else "Liverpool", "away": "France",
+                     "date": date, "state": "in" if short == "UNL" else "post"}]
+
+        with patch.object(app, "_fetch_league_scores", fetch):
+            matches = await app._refresh_scores()
+        self.assertTrue(all("-" not in date for date in requests))
+        self.assertEqual(matches[0]["state"], "in")
+        self.assertIn("UNL", {match["league_short"] for match in matches})
+
+    def test_major_fixture_beats_minor_fixture(self):
+        important = {"home": "England", "away": "France", "league_short": "UNL", "stage": "Final"}
+        minor = {"home": "Small Club", "away": "Other Club", "league_short": "L1"}
+        self.assertGreater(app._score_match(important), app._score_match(minor))
+
+    async def test_one_failed_league_does_not_break_other_results(self):
+        async def fetch(code, name, short, date):
+            if code == "eng.1":
+                raise ValueError("Malformed upstream result")
+            return [{"event_id": code + date, "league_code": code, "league_short": short,
+                     "home": "England", "away": "France", "date": date, "state": "post"}]
+
+        with patch.object(app, "_fetch_league_scores", fetch):
+            matches = await app._refresh_scores()
+        self.assertTrue(matches)
+        self.assertNotIn("eng.1", {match["league_code"] for match in matches})
+
+
 class ResearchRankingTests(unittest.TestCase):
     def item(self, title, description="", source="arXiv CS.IR", days=0):
         return {
@@ -37,6 +94,127 @@ class ResearchRankingTests(unittest.TestCase):
         recent = self.item("Dense retrieval evaluation", "Code and dataset")
         older = self.item("Dense retrieval evaluation", "Code and dataset", days=7)
         self.assertGreater(app._score_ai_article(older), app._score_ai_article(recent) * 0.45)
+
+    def test_expert_tutorial_beats_fresh_keyword_rich_benchmark(self):
+        tutorial = self.item("Conformal prediction under distribution shift",
+                             "A derivation and worked example with a notebook, baselines, "
+                             "confidence intervals and production trade-offs.", "Sebastian Raschka", days=100)
+        benchmark = self.item("A benchmark for multimodal LLM agents and reasoning",
+                             "We introduce a new dataset and evaluation benchmark.")
+        self.assertGreater(app._score_ai_article(tutorial), app._score_ai_article(benchmark))
+
+    def test_classical_ml_and_statistics_topics_are_covered(self):
+        for title, expected in (("Gradient boosting on tabular data", "Tabular"),
+                                ("Causal inference with treatment effects", "Causal"),
+                                ("Conformal prediction for uncertainty", "Statistics"),
+                                ("Time series forecasting", "Time Series")):
+            with self.subTest(title=title):
+                self.assertEqual(app._tag_ai_article(self.item(title)), expected)
+
+    def test_advanced_introduction_is_not_treated_as_beginner_noise(self):
+        advanced = self.item("Introduction to causal inference",
+                             "Derivation, implementation and failure modes with baselines.")
+        thin = self.item("Introduction to causal inference", "A quick overview.")
+        self.assertGreater(app._score_ai_article(advanced), app._score_ai_article(thin) + 10)
+
+    def test_learning_signals_are_grounded_in_text(self):
+        self.assertEqual(app._learning_signals(self.item("A new model")), [])
+        self.assertIn("Evaluation & reliability", app._learning_signals(self.item("Data leakage and failure modes")))
+
+    def test_recent_publisher_model_launch_is_not_generic_marketing(self):
+        release = self.item("Introducing Claude: a new reasoning model", "Now available with model weights", "Anthropic")
+        self.assertEqual(app._research_kind(release), "release")
+        self.assertGreater(app._score_ai_article(release), 20)
+        old = self.item(release["title"], release["description"], "Anthropic", days=60)
+        self.assertNotEqual(app._research_kind(old), "release")
+
+    def test_release_slots_do_not_remove_technical_reading(self):
+        releases = [self.item(f"Introducing GPT model {index}", "A new language model", "OpenAI") for index in range(10)]
+        blog = self.item("Bayesian inference derivation", "Proof and baselines", "Sebastian Raschka")
+        results = app._process_feeds(releases + [blog], "ai_research")
+        self.assertEqual(results[0]["kind"], "release")
+        self.assertLessEqual(sum(item["kind"] == "release" for item in results), 4)
+        self.assertIn("blog", [item["kind"] for item in results])
+
+    def test_community_hype_is_not_a_confirmed_model_release(self):
+        item = self.item("Introducing Claude: new model released", "State of the art", "HN AI")
+        self.assertEqual(app._research_kind(item), "community")
+
+    def test_publisher_release_precedes_community_model_conversions(self):
+        release = self.item("Introducing Gemini: new model", "Now available", "DeepMind")
+        conversions = []
+        for index in range(10):
+            item = self.item(f"Quantized model {index}", "", "HF Model Releases")
+            item.update(model_id=f"community/conversion-{index}", trending_score=1000)
+            conversions.append(item)
+        results = app._process_feeds(conversions + [release], "ai_research")
+        self.assertEqual(results[0]["source"], "DeepMind")
+        self.assertLessEqual(sum(item["source"] == "HF Model Releases" for item in results), 2)
+
+    def test_customer_conversion_story_is_not_a_methodology_lesson(self):
+        story = self.item("Example grows product signups with conversion optimization", source="OpenAI")
+        self.assertEqual(app._learning_signals(story), [])
+        self.assertLess(app._score_ai_article(story), 9)
+
+    def test_curated_feed_preserves_cited_arxiv_papers(self):
+        feed = b'''<rss><channel><item><title>Conformal prediction: a derivation</title>
+        <link>https://example.com/post</link><description><![CDATA[Implementation and proof.
+        <a href="https://arxiv.org/abs/2107.07511v2">Paper</a>
+        <a href="https://arxiv.org/pdf/2107.07511.pdf">PDF</a>
+        <a href="https://example.com/abs/1234.56789">Not arXiv</a>]]></description>
+        </item></channel></rss>'''
+        item = app._parse_feed("Sebastian Raschka", feed)[0]
+        self.assertEqual(item["citedPapers"], ["2107.07511"])
+
+    def test_revisited_foundational_paper_preserves_original_date(self):
+        paper = self.item("Conformal prediction with uncertainty quantification", "Proof and baselines",
+                          "Expert-cited Papers", days=1000)
+        original_date = paper["published"]
+        paper.update(citedBy=["Sebastian Raschka"], citedAt=datetime.now(timezone.utc).isoformat())
+        self.assertGreater(app._score_ai_article(paper), 15)
+        self.assertEqual(paper["published"], original_date)
+
+    def test_core_data_science_topics_survive_popular_ai_papers(self):
+        papers = [self.item(f"Multimodal agents LLM benchmark {index}", "Ablation implementation",
+                            "HF Daily Papers") for index in range(25)]
+        statistics = self.item("Conformal prediction theory", "Proof and confidence interval", "arXiv stat.ML")
+        result = app._process_feeds(papers + [statistics], "ai_research")
+        self.assertIn("Statistics", [item["tag"] for item in result])
+
+    def test_authored_learning_material_is_not_crowded_out_by_vendor_posts(self):
+        vendors = [self.item(f"Production implementation for LLM systems {index}",
+                             "Ablation, proof and implementation in production.", "Nvidia AI")
+                   for index in range(20)]
+        authors = [self.item(f"Conformal prediction notebook {index}", "Proof and baselines",
+                             source, days=120)
+                   for index, source in enumerate(("BAIR", "Sebastian Raschka", "Maarten Grootendorst"))]
+        results = app._process_feeds(vendors + authors, "ai_research")
+        self.assertTrue({item["source"] for item in authors}.issubset({item["source"] for item in results}))
+        self.assertLessEqual(sum(item["source"] == "Nvidia AI" for item in results), 2)
+
+    def test_papers_do_not_crowd_out_technical_blogs(self):
+        papers = [self.item(f"LLM agent evaluation {index}", "Ablation and implementation", "HF Daily Papers")
+                  for index in range(25)]
+        blogs = [self.item(f"Statistical inference example {index}", "Derivation and notebook",
+                           source, days=90)
+                 for index, source in enumerate(("BAIR", "Chip Huyen", "Lil'Log", "Sebastian Raschka"))]
+        result = app._process_feeds(papers + blogs, "ai_research")
+        self.assertEqual(sum(item["kind"] == "blog" for item in result), 4)
+        self.assertLessEqual(sum(item["tag"] == "Agents" for item in result), 6)
+
+    def test_community_discussion_cannot_dominate_learning_feed(self):
+        items = [self.item(f"Tabular model production {index}", "Implementation baselines",
+                           source)
+                 for index, source in enumerate(["HN AI", "r/MachineLearning", "r/LocalLLaMA"] * 8)]
+        result = app._process_feeds(items, "ai_research")
+        self.assertLessEqual(len(result), 2)
+
+    def test_generic_topic_words_are_not_independent_corroboration(self):
+        first = self.item("Alpha benchmark for LLM agents")
+        second = self.item("Beta benchmark for LLM agents", source="HF Daily Papers")
+        ranked = app._process_feeds([first, second], "ai_research")
+        target = next(item for item in ranked if item["title"] == first["title"])
+        self.assertAlmostEqual(target["score"], app._score_ai_article(first), places=4)
 
     def test_scans_past_first_eight_entries_and_keeps_abstract(self):
         entries = [f"<item><title>Unrelated topic {index}</title><link>https://example.com/{index}</link></item>"
@@ -109,6 +287,45 @@ class FeedConcurrencyTests(unittest.IsolatedAsyncioTestCase):
 
     def request(self, category="ai_research"):
         return Request({"type": "http", "path_params": {"category": category}, "headers": []})
+
+    async def test_model_discovery_uses_trends_and_does_not_relabel_old_models(self):
+        now = datetime.now(timezone.utc)
+        requests = []
+
+        def handle(request):
+            requests.append(request)
+            return httpx.Response(200, json=[
+                {"id": "google/gemma-new", "createdAt": now.isoformat(), "trendingScore": 100, "likes": 50},
+                {"id": "google/old-popular-model", "createdAt": (now - timedelta(days=365)).isoformat(),
+                 "lastModified": now.isoformat(), "trendingScore": 1000, "likes": 10000},
+            ])
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            with patch.object(app, "_http_client", client):
+                releases = await app._fetch_model_releases()
+                await app._fetch_hf_trending_models()
+        self.assertEqual(requests[0].url.params["sort"], "trendingScore")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual([item["model_id"] for item in releases], ["google/gemma-new"])
+
+    async def test_cited_paper_enrichment_is_batched_bounded_and_attributed(self):
+        items = [{"title": "Conformal prediction derivation", "description": "Proof and implementation",
+                  "source": "Sebastian Raschka", "published": "2026-11-01T00:00:00+00:00",
+                  "citedPapers": [f"2601.{index:05}" for index in range(20)]}]
+        calls = []
+
+        async def fetch(name, url):
+            calls.append((name, url))
+            return [{"title": "Conformal prediction", "link": "https://arxiv.org/abs/2601.00000v2",
+                     "published": "2026-01-01T00:00:00+00:00"}]
+
+        with patch.object(app, "_fetch_feed_throttled", fetch):
+            papers = await app._fetch_cited_papers(items)
+        self.assertEqual(len(calls), 1)
+        query = app.urllib.parse.parse_qs(app.urllib.parse.urlsplit(calls[0][1]).query)
+        self.assertEqual(len(query["id_list"][0].split(",")), 12)
+        self.assertEqual(papers[0]["citedBy"], ["Sebastian Raschka"])
+        self.assertEqual(papers[0]["published"], "2026-01-01T00:00:00+00:00")
 
     async def test_concurrent_json_and_stream_share_refresh(self):
         calls = 0
